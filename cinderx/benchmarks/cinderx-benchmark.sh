@@ -58,8 +58,13 @@ CINDERX_REPO="${CINDERX_REPO:-https://github.com/facebookincubator/cinderx.git}"
 CINDERX_TAG="${CINDERX_TAG:-main}"             # only used with --cinderx-source
 CINDERX_VERSION="${CINDERX_VERSION:-}"         # pin a PyPI version, e.g. 2026.6.25.0 (empty = latest)
 CINDERX_SOURCE="${CINDERX_SOURCE:-0}"          # 1 = build CinderX from git instead of PyPI wheel (for the dynamic/plain venv)
-CINDERX_CC="${CINDERX_CC:-}"                    # override C compiler for CPython + CinderX (default: auto-detect)
-CINDERX_CXX="${CINDERX_CXX:-}"                  # override C++ compiler for CPython + CinderX (default: auto-detect)
+CINDERX_CC="${CINDERX_CC:-}"                    # override C compiler for CPython + CinderX (default: auto-detect); CLI: --cc
+CINDERX_CXX="${CINDERX_CXX:-}"                  # override C++ compiler for CPython + CinderX (default: auto-detect); CLI: --cxx
+# Where each compiler override came from, for validation error messages. Seeded
+# from the env vars now; the CLI parser rewrites these to "--cc"/"--cxx" when the
+# flags are used (CLI beats env). Empty => not explicitly provided => auto-detect.
+CC_ORIGIN=""; [ -n "$CINDERX_CC" ] && CC_ORIGIN="env var CINDERX_CC"
+CXX_ORIGIN=""; [ -n "$CINDERX_CXX" ] && CXX_ORIGIN="env var CINDERX_CXX"
 CINDERX_LIBSTDCXX_A="${CINDERX_LIBSTDCXX_A:-}"  # override static libstdc++.a fallback path (default: ask the C++ compiler via -print-file-name)
 
 WORKDIR="${WORKDIR:-}"                          # REQUIRED: root for everything. No default — pass --workdir DIR (or set $WORKDIR).
@@ -178,6 +183,17 @@ SOURCES / VERSIONS:
   --cinderx-repo URL     CinderX git remote (used for both static build and source build).
   --cinderx-tag TAG      CinderX git tag/branch.
 
+COMPILER / TOOLCHAIN:
+  --cc PATH              C compiler for CPython + CinderX (full path or command
+                        name, e.g. --cc /opt/gcc-15/bin/gcc). Overrides CINDERX_CC.
+  --cxx PATH            C++ compiler for CPython + CinderX (full path or command
+                        name, e.g. --cxx /opt/gcc-15/bin/g++). Overrides CINDERX_CXX.
+                        Precedence: --cc/--cxx > CINDERX_CC/CINDERX_CXX > auto-detect.
+                        When a compiler is given explicitly, auto-detection is
+                        skipped for it and the path is validated (must exist and be
+                        executable). Giving only --cxx derives the sibling C
+                        compiler (g++->gcc, clang++->clang) unless --cc is also set.
+
 RUN TUNING:
   --workdir DIR          Root for sources/build/venv/results (REQUIRED — no default)
   --jobs N               make -j parallelism                  (default: nproc)
@@ -197,8 +213,9 @@ ENVIRONMENT VARIABLES:
   JIT_THRESHOLD, JIT_BUDGET, ...). CLI flags take precedence over env vars.
   WORKDIR is required: set it via --workdir or the $WORKDIR env var (no default).
   CINDERX_CC / CINDERX_CXX override the auto-detected compiler used for BOTH
-  CPython and the CinderX archives; CINDERX_LIBSTDCXX_A overrides the static
-  libstdc++.a fallback path used when relinking the static interpreter.
+  CPython and the CinderX archives (the --cc / --cxx flags take precedence over
+  them); CINDERX_LIBSTDCXX_A overrides the static libstdc++.a fallback path used
+  when relinking the static interpreter.
 
 OUTPUT:
   Results, logs and markdown reports are written under  <workdir>/results/ .
@@ -240,6 +257,8 @@ while [ $# -gt 0 ]; do
     --cinderx-version)    CINDERX_VERSION="$2"; shift ;;
     --cinderx-repo)       CINDERX_REPO="$2"; shift ;;
     --cinderx-tag)        CINDERX_TAG="$2"; shift ;;
+    --cc)                 CINDERX_CC="$2";  CC_ORIGIN="--cc";  shift ;;
+    --cxx)                CINDERX_CXX="$2"; CXX_ORIGIN="--cxx"; shift ;;
     --workdir)            WORKDIR="$2"; shift ;;
     --jobs)               JOBS="$2"; shift ;;
     --affinity)           AFFINITY="$2"; shift ;;
@@ -315,12 +334,12 @@ preflight() {
   for t in git make; do
     command -v "$t" >/dev/null 2>&1 || { warn "missing required tool: $t"; missing=1; }
   done
-  # A C compiler: gcc or clang.
-  if command -v gcc >/dev/null 2>&1; then
-    ok "C compiler: $(gcc --version | head -1)"
-  elif command -v clang >/dev/null 2>&1; then
-    ok "C compiler: $(clang --version | head -1)"
-  else
+  # A C compiler must be present. We only check for existence here — do NOT report
+  # a version from it, because the system gcc/clang seen on PATH is often NOT the
+  # compiler the build uses: detect_toolchain() (called below) selects a C++20
+  # toolchain that may be a different compiler entirely (e.g. clang++ 22 instead of
+  # gcc 11.5). The authoritative CC/CXX version report is printed after detection.
+  if ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
     warn "no C compiler (gcc/clang) found"; missing=1
   fi
   command -v taskset >/dev/null 2>&1 || [ -z "$AFFINITY" ] || \
@@ -338,7 +357,14 @@ preflight() {
   # the static interpreter (builtin _cinderx) is always built.
   detect_toolchain
   if [ -n "$TOOLCHAIN_CXX" ]; then
-    ok "Toolchain (CPython + CinderX): CXX=$TOOLCHAIN_CXX  CC=${TOOLCHAIN_CC:-cc} ($("$TOOLCHAIN_CXX" --version 2>&1 | head -1))"
+    # Report BOTH compilers that detect_toolchain() actually selected — these are
+    # exactly the CC/CXX passed to ./configure and cmake (and already reflect any
+    # --cc/--cxx or CINDERX_CC/CINDERX_CXX overrides). Show each one's own
+    # --version so the preflight can't misreport the system gcc.
+    local _cc="${TOOLCHAIN_CC:-cc}"
+    ok "Toolchain (CPython + CinderX): CC=$_cc  CXX=$TOOLCHAIN_CXX"
+    ok "  CC  version: $("$_cc" --version 2>&1 | head -1)"
+    ok "  CXX version: $("$TOOLCHAIN_CXX" --version 2>&1 | head -1)"
     if [ -n "$TOOLCHAIN_LIBSTDCXX" ]; then
       ok "Static libstdc++ fallback present: $TOOLCHAIN_LIBSTDCXX (used only if the default dynamic -lstdc++ link fails)"
     else
@@ -496,8 +522,31 @@ PYEOF
 #                                  first call -- validated in the profiling task).
 #   (d) (none of the above)     -> cinderx.jit.auto()  (blanket auto-JIT baseline).
 # Benchmark name is detected from sys.argv[0] = .../bm_<name>/run_benchmark.py.
+#
+# IMPORTANT (pyperformance workers): pyperformance runs each benchmark inside an
+# isolated "compat" venv that contains neither this file nor cinderx. We are put
+# back on that worker's path by placing a *minimal* directory holding a copy of
+# this file on PYTHONPATH (whitelisted by both pyperformance and pyperf, so it
+# survives into the worker). cinderx itself is made importable there by
+# _add_cinderx_site() below, which site.addsitedir()'s the real benchmark venv's
+# site-packages -- APPENDING it (so it lands after the stdlib and after the
+# compat venv's own packages: no shadowing) and PROCESSING its .pth files (needed
+# for the static config, whose cinderx comes from cinderx_pythonlib.pth).
 import os
 import sys
+
+
+def _add_cinderx_site():
+    # Make cinderx importable inside pyperformance's isolated compat venv without
+    # shadowing anything. CINDERX_SITE_DIR is an os.pathsep-separated list of the
+    # config's real venv site-packages director(ies).
+    raw = os.environ.get("CINDERX_SITE_DIR", "")
+    if not raw:
+        return
+    import site
+    for d in raw.split(os.pathsep):
+        if d and os.path.isdir(d) and d not in sys.path:
+            site.addsitedir(d)  # append (no stdlib shadowing) + process .pth files
 
 
 def _detect_benchmark():
@@ -511,25 +560,75 @@ def _detect_benchmark():
     return d[3:] if d.startswith("bm_") else None
 
 
+def _banner(mode):
+    # One-line, machine-greppable proof of what this worker actually did. Emitted
+    # to stderr when BENCH_CINDERX_BANNER=1, and (because pyperf hides worker
+    # stderr on success) also appended to BENCH_CINDERX_BANNER_FILE when set, so
+    # the real benchmark workers leave an auditable trail.
+    want = os.environ.get("BENCH_CINDERX_BANNER", "") == "1"
+    fpath = os.environ.get("BENCH_CINDERX_BANNER_FILE", "")
+    if not want and not fpath:
+        return
+    loaded = 1 if "cinderx" in sys.modules else 0
+    enabled = 0
+    ver = "?"
+    if loaded:
+        try:
+            import importlib.metadata as _md
+            ver = _md.version("cinderx")
+        except Exception:
+            ver = getattr(sys.modules.get("cinderx"), "__version__", None) or "?"
+        try:
+            import cinderx.jit as _j
+            # NOTE: is_enabled() is True merely from importing cinderx, so it does
+            # NOT distinguish nojit from auto. The real signal for "the JIT will
+            # actually compile code" is an armed auto-threshold OR a loaded jit
+            # list. jit=1 here means auto/jitlist is truly active; nojit -> 0.
+            _armed = _j.get_compile_after_n_calls() is not None
+            _listed = bool(_j.get_jit_list() or [])
+            enabled = 1 if (_armed or _listed) else 0
+        except Exception:
+            pass
+    bench = _detect_benchmark() or (os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "?")
+    line = ("cinderx-banner: mode=%s loaded=%d jit=%d version=%s bench=%s pid=%d"
+            % (mode, loaded, enabled, ver, bench, os.getpid()))
+    if want:
+        print(line, file=sys.stderr)
+    if fpath:
+        try:
+            with open(fpath, "a") as fh:  # O_APPEND: concurrent short-line writes are atomic
+                fh.write(line + "\n")
+        except Exception:
+            pass
+
+
 def _setup():
+    # Always run first, even for the "off" configs: this only extends sys.path so
+    # that *if* a policy wants cinderx it is importable; it does not enable it.
+    _add_cinderx_site()
+
     if os.environ.get("CINDERX_DISABLE", "") == "1":
+        _banner("off")
         return  # (a) no CinderX at all
     try:
         import cinderx  # noqa: F401  (init the runtime even in no-jit mode)
         import cinderx.jit as jit
     except Exception as e:
         print("sitecustomize: cinderx import failed: %r" % (e,), file=sys.stderr)
+        _banner("import-failed")
         return
 
     if os.environ.get("CINDERX_NO_JIT", "") == "1":
         # (b) cinderx imported, but the JIT is left disabled on purpose.
         if os.environ.get("BENCH_JITLIST_VERBOSE") == "1":
             print("sitecustomize: cinderx imported, JIT NOT enabled", file=sys.stderr)
+        _banner("nojit")
         return
 
     jitdir = os.environ.get("BENCH_JITLIST_DIR", "")
     if not jitdir:
         jit.auto()  # (d) baseline
+        _banner("auto")
         return
 
     # (c) per-benchmark JIT list
@@ -540,6 +639,7 @@ def _setup():
             jit.read_jit_list(path)  # NOTE: no auto() on purpose
             if os.environ.get("BENCH_JITLIST_VERBOSE") == "1":
                 print("sitecustomize: JIT list %s" % path, file=sys.stderr)
+            _banner("jitlist")
             return
         except Exception as e:
             print("sitecustomize: read_jit_list(%s) failed: %r" % (path, e),
@@ -547,7 +647,10 @@ def _setup():
     # No list for this benchmark.
     if os.environ.get("BENCH_JITLIST_FALLBACK", "none") == "auto":
         jit.auto()
-    # else: JIT enabled, no list + no threshold -> compiles nothing (isolates effect)
+        _banner("jitlist-fallback-auto")
+    else:
+        # JIT enabled, no list + no threshold -> compiles nothing (isolates effect)
+        _banner("jitlist-none")
 
 
 _setup()
@@ -623,6 +726,58 @@ with open(out, "w") as f:
 print(text)
 PYEOF
 
+  # --- cinderx_shim/ : no-op cinderx fallback for Suite A "off" configs ----
+  # The built-in benchmark scripts (binary_trees.py, ...) are downloaded source
+  # we may not modify, and they do `import cinderx.jit` + `cinderx.jit.auto()`
+  # UNCONDITIONALLY at module scope. On an interpreter that has no real cinderx
+  # (the plain venv when no dynamic CinderX wheel is installed) that import is a
+  # hard ModuleNotFoundError, so the benchmark can't even start.
+  #
+  # For the "off" configurations (CINDERX_DISABLE=1) we don't WANT the JIT anyway
+  # -- "off" is the plain-CPython baseline. This shim provides a minimal cinderx
+  # package whose jit.auto() (and friends) are no-ops, so the untouched benchmark
+  # imports cleanly and runs as pure CPython. It is placed on PYTHONPATH ONLY when
+  # the interpreter cannot import the REAL cinderx AND the config is an "off" one,
+  # so it never shadows a real (builtin/static or dynamic-wheel) cinderx.
+  local shimdir="$HELPERS/cinderx_shim/cinderx"
+  mkdir -p "$shimdir"
+  cat > "$shimdir/__init__.py" <<'PYEOF'
+# No-op cinderx shim (Suite A "off" configs only). See cinderx-benchmark.sh.
+# Present so `import cinderx` / `import cinderx.jit` succeed with the JIT disabled.
+__version__ = "0.0.0+shim"
+PYEOF
+  cat > "$shimdir/jit.py" <<'PYEOF'
+# No-op cinderx.jit shim: every entry point is a harmless no-op so the untouched
+# benchmark scripts (which call cinderx.jit.auto() unconditionally) run as plain
+# CPython. Used ONLY for "off" configs on interpreters lacking a real cinderx.
+def auto(*args, **kwargs):
+    return None
+
+
+def is_enabled(*args, **kwargs):
+    return False
+
+
+def disable(*args, **kwargs):
+    return None
+
+
+def read_jit_list(*args, **kwargs):
+    return None
+
+
+def get_jit_list(*args, **kwargs):
+    return []
+
+
+def get_compiled_functions(*args, **kwargs):
+    return []
+
+
+def get_compile_after_n_calls(*args, **kwargs):
+    return None
+PYEOF
+
   ok "Helpers written"
 }
 
@@ -639,7 +794,17 @@ build_cpython() {
   fi
   log "Cloning CPython $CPYTHON_TAG from $CPYTHON_REPO"
   if [ ! -d "$SRC_CPYTHON/.git" ]; then
-    git clone --depth 1 --branch "$CPYTHON_TAG" "$CPYTHON_REPO" "$SRC_CPYTHON" \
+    # CPython release tags (v3.14.5, ...) are ANNOTATED tags: the ref points at a
+    # tag OBJECT, not a commit. `git clone --depth 1 --branch <annotated-tag>`
+    # does shallow-clone the right tree, but the shallow negotiation lists that
+    # tag ref and git prints "warning: refs/tags/<tag> <sha> is not a commit!".
+    # Fetch the ref explicitly instead and check out the commit it resolves to:
+    # FETCH_HEAD is always dereferenced to a commit, so there is no warning. This
+    # form is also transparent for branches and lightweight tags.
+    { git init -q "$SRC_CPYTHON" \
+        && git -C "$SRC_CPYTHON" remote add origin "$CPYTHON_REPO" \
+        && git -C "$SRC_CPYTHON" fetch --depth 1 origin "$CPYTHON_TAG" \
+        && git -C "$SRC_CPYTHON" -c advice.detachedHead=false checkout --detach FETCH_HEAD ; } \
       2>&1 | tee "$LOGDIR/cpython_clone.log" || die "CPython clone failed"
   else
     ok "CPython checkout already present at $SRC_CPYTHON"
@@ -741,9 +906,27 @@ cxx_supports_cxx20() {
 # Everything here is generic: no hardcoded toolchain paths, so it works on any
 # Linux (Ubuntu/Debian system gcc, Fedora/RHEL gcc-toolset on PATH, clang, etc.).
 # Honours CINDERX_CXX / CINDERX_CC / CINDERX_LIBSTDCXX_A overrides in all modes.
+# Validate an explicitly-provided compiler (via --cc/--cxx or CINDERX_CC/CINDERX_CXX)
+# exists and is executable. Accepts a full path (e.g. /opt/gcc-15/bin/gcc, checked
+# with -x) or a bare command name resolved on PATH (via command -v). $3 is a label
+# describing where the value came from, for a clear error message.
+validate_compiler() {
+  local what="$1" comp="$2" origin="$3"
+  case "$comp" in
+    */*) [ -x "$comp" ] || die "$what from $origin does not exist or is not executable: $comp" ;;
+    *)   command -v "$comp" >/dev/null 2>&1 || die "$what from $origin not found on PATH: $comp" ;;
+  esac
+}
+
 detect_toolchain() {
   # Idempotent: detection is cheap but several phases call this.
   [ -n "$TOOLCHAIN_CXX" ] && return 0
+
+  # Validate any explicitly-provided compiler up front (CLI flags or env vars).
+  # These override auto-detection, so a bad path should fail loudly rather than
+  # silently fall through to a probed compiler.
+  [ -n "$CINDERX_CC" ]  && validate_compiler "C compiler"   "$CINDERX_CC"  "$CC_ORIGIN"
+  [ -n "$CINDERX_CXX" ] && validate_compiler "C++ compiler" "$CINDERX_CXX" "$CXX_ORIGIN"
 
   if [ -n "$CINDERX_CXX" ]; then
     # Explicit override: trust the caller's choice of C++ compiler.
@@ -1046,7 +1229,15 @@ install_cinderx() {
   fi
   [ -n "$VPY" ] || die "plain venv not ready"
 
-  if "$VPY" -c 'import cinderx' >/dev/null 2>&1; then
+  # Idempotency probe MUST use the plain venv python ($VPY) and MUST test
+  # 'import cinderx.jit', not the bare 'import cinderx'. The top-level package is
+  # pure Python and can import even when the native runtime is missing; only
+  # 'cinderx.jit' (which needs the _cinderx extension) proves CinderX is actually
+  # usable. This matches sitecustomize, the post-install verify, and the JIT-list
+  # generator -- all of which require 'import cinderx.jit'. Using the weaker probe
+  # here caused a false "already importable; skipping install" while the workers'
+  # sitecustomize reported "cinderx import failed: ModuleNotFoundError".
+  if "$VPY" -c 'import cinderx.jit' >/dev/null 2>&1; then
     ok "Dynamic CinderX already importable in plain venv; skipping install"
     return
   fi
@@ -1131,31 +1322,86 @@ gen_jitlists() {
     ok "JIT lists already present in $JITLIST_DIR ($(ls "$JITLIST_DIR"/*.jitlist | wc -l) lists); skipping (use --regen-jitlists to rebuild)"
     return
   fi
+  # Pick an interpreter that can actually import cinderx to drive generation.
+  # JIT lists are just module:qualname lines (interpreter-agnostic), so either
+  # venv can produce them and the result is shared by all eight configs. Prefer
+  # the plain venv (matches the dynamic configs); fall back to the static venv,
+  # whose builtin _cinderx is always present. Without this, a plain venv that
+  # lacks the dynamic CinderX wheel (e.g. a run with --skip-cinderx, or no PyPI
+  # wheel for this CPython) makes gen_jitlist.py raise ModuleNotFoundError for
+  # EVERY benchmark and silently emit empty lists (the "funcs=0" symptom).
+  local genpy="" genlabel=""
+  if [ -n "$VPY" ] && "$VPY" -c 'import cinderx.jit' >/dev/null 2>&1; then
+    genpy="$VPY"; genlabel="plain venv"
+  elif [ -n "$VPY_STATIC" ] && "$VPY_STATIC" -c 'import cinderx.jit' >/dev/null 2>&1; then
+    genpy="$VPY_STATIC"; genlabel="static venv"
+    warn "Plain venv cannot 'import cinderx'; generating JIT lists with the static venv instead."
+    warn "The dynamic configs (dyn-nojit/dyn-auto/dyn-jitlist) will FAIL for the same reason —"
+    warn "install the dynamic CinderX into $VENV (re-run without --skip-cinderx; add --cinderx-source if there is no PyPI wheel for this CPython)."
+  else
+    die "Neither venv can 'import cinderx.jit'; cannot generate JIT lists. Install CinderX first (dynamic wheel into the plain venv and/or the builtin in the static interpreter)."
+  fi
+  ok "Generating JIT lists with the $genlabel"
+
   local pp
-  pp="$("$VPY" -c 'import pyperformance,os;print(os.path.dirname(pyperformance.__file__))')" \
-    || die "pyperformance not importable; cannot generate JIT lists"
+  pp="$("$genpy" -c 'import pyperformance,os;print(os.path.dirname(pyperformance.__file__))')" \
+    || die "pyperformance not importable in the $genlabel; cannot generate JIT lists"
   local D="$pp/data-files/benchmarks"
   log "Generating JIT lists (threshold=$JIT_THRESHOLD, budget=${JIT_BUDGET}s) -> $JITLIST_DIR"
 
+  # Expand the benchmark selection. If it contains the special token "all"
+  # (optionally with negative excludes, e.g. "all,-telco,-unpack_sequence"),
+  # resolve it through pyperformance itself so we generate JIT lists for exactly
+  # the set pyperformance would run: "all" = every benchmark declared in the
+  # manifest, minus any -excludes, and filtered to those runnable on this
+  # interpreter. `pyperformance list -b <sel>` prints one "- <name>" per line.
+  # A plain list of benchmark names is used verbatim (no behaviour change).
+  local benches="$PYPERF_BENCHES"
+  if printf '%s' ",$PYPERF_BENCHES," | grep -qiE ',[[:space:]]*all[[:space:]]*,'; then
+    log "Benchmark list contains 'all'; expanding via pyperformance list -b '$PYPERF_BENCHES'"
+    benches="$("$genpy" -m pyperformance list -b "$PYPERF_BENCHES" 2>/dev/null \
+                 | sed -n 's/^- //p' | tr '\n' ',')"
+    benches="${benches%,}"
+    [ -n "$benches" ] || die "could not expand 'all' via 'pyperformance list -b $PYPERF_BENCHES' (is pyperformance installed in the $genlabel?)"
+    ok "Expanded 'all' to $(printf '%s' "$benches" | tr ',' '\n' | grep -c .) benchmarks"
+  fi
+
+  # Track outcomes so a systemic failure (e.g. cinderx not importable) is loud
+  # instead of silently leaving a directory full of empty lists.
+  local made=0 failed=0
   local IFS=','
-  for b in $PYPERF_BENCHES; do
+  for b in $benches; do
     local bm="$D/bm_$b/run_benchmark.py"
     if [ ! -f "$bm" ]; then warn "no pyperformance benchmark bm_$b; skipping list"; continue; fi
     local jl="$JITLIST_DIR/$b.jitlist"
-    JIT_THRESHOLD="$JIT_THRESHOLD" "$VPY" "$HELPERS/gen_jitlist.py" "$bm" \
-        --budget "$JIT_BUDGET" >"$LOGDIR/gjl_$b.out" 2>"$LOGDIR/gjl_$b.err"
+    local rc=0
+    JIT_THRESHOLD="$JIT_THRESHOLD" "$genpy" "$HELPERS/gen_jitlist.py" "$bm" \
+        --budget "$JIT_BUDGET" >"$LOGDIR/gjl_$b.out" 2>"$LOGDIR/gjl_$b.err" || rc=$?
+    # Count only real entries (non-comment, non-blank). grep -c already prints 0
+    # and exits 1 on no match, so the earlier "|| echo 0" doubled the count.
     local n
-    n="$(grep -vcE '^\s*(#|$)' "$LOGDIR/gjl_$b.out" 2>/dev/null || echo 0)"
+    n="$(grep -vcE '^[[:space:]]*(#|$)' "$LOGDIR/gjl_$b.out" 2>/dev/null)"; n="${n:-0}"
     {
       echo "# CinderX JIT list for pyperformance bm_$b"
-      echo "# gen_jitlist.py threshold=$JIT_THRESHOLD budget=${JIT_BUDGET}s"
+      echo "# gen_jitlist.py threshold=$JIT_THRESHOLD budget=${JIT_BUDGET}s (via $genlabel)"
       echo "# $(tail -1 "$LOGDIR/gjl_$b.err" 2>/dev/null)"
       echo "# Format: module:qualname (one hot function per line)"
       cat "$LOGDIR/gjl_$b.out"
     } > "$jl"
-    printf '    %-16s funcs=%s\n' "$b" "$n"
+    if [ "$rc" -ne 0 ]; then
+      warn "$(printf '%-16s FAILED (rc=%s; see %s)' "$b" "$rc" "$LOGDIR/gjl_$b.err")"
+      failed=$((failed + 1))
+    else
+      printf '    %-16s funcs=%s\n' "$b" "$n"
+      made=$((made + 1))
+    fi
   done
-  ok "JIT lists generated in $JITLIST_DIR"
+
+  if [ "$made" -eq 0 ]; then
+    die "JIT-list generation produced no usable lists ($failed failed); see $LOGDIR/gjl_*.err"
+  fi
+  [ "$failed" -eq 0 ] || warn "$failed JIT list(s) failed to generate; see $LOGDIR/gjl_*.err"
+  ok "JIT lists generated in $JITLIST_DIR ($made ok, $failed failed)"
 }
 
 ###############################################################################
@@ -1183,14 +1429,41 @@ run_builtin() {
       IFS='|' read -r cname kind cenv <<< "$cfgrow"
       vpy="$(config_vpy "$kind")"
       [ -x "$vpy" ] || { warn "venv for config $cname missing ($vpy); skipping"; continue; }
+
+      # The built-in benchmark scripts are downloaded source we can't modify, and
+      # they `import cinderx.jit` (+ call cinderx.jit.auto()) unconditionally at
+      # module scope. Decide how to satisfy that import for THIS config's
+      # interpreter:
+      #   - real cinderx importable (static venv builtin, or plain venv with a
+      #     dynamic CinderX wheel) -> run as-is; the script's own auto() applies.
+      #   - no real cinderx + "off" config -> put the no-op cinderx shim on
+      #     PYTHONPATH so the bench runs as a genuine plain-CPython baseline
+      #     (off == JIT disabled, which is exactly what the shim yields).
+      #   - no real cinderx + non-off config -> a JIT config with no engine
+      #     available; SKIP (don't fabricate plain-CPython numbers under a JIT
+      #     label). Requires the dynamic CinderX wheel in the plain venv.
+      local pypath_extra="" run_note=""
+      if "$vpy" -c 'import cinderx.jit' >/dev/null 2>&1; then
+        : # real cinderx available; nothing extra needed
+      elif [ "${cname##*-}" = "off" ]; then
+        pypath_extra="$HELPERS/cinderx_shim"
+        run_note=" [cinderx shim: no real cinderx, JIT disabled]"
+      else
+        for t in $(seq 1 "$TRIALS"); do
+          printf '%s\t%s\t%s\tSKIP\t\n' "$name" "$cname" "$t" >> "$tsv"
+        done
+        warn "$name/$cname SKIPPED: interpreter cannot import cinderx and config needs the JIT (install the dynamic CinderX wheel into the plain venv)"
+        continue
+      fi
+
       for t in $(seq 1 "$TRIALS"); do
         local errf="$LOGDIR/builtin_${name}_${cname}_${t}.log"
         local secs
-        secs="$( { /usr/bin/time -f '%e' env $cenv $TSPRE "$vpy" "$script" "$arg" \
+        secs="$( { /usr/bin/time -f '%e' env $cenv ${pypath_extra:+PYTHONPATH="$pypath_extra${PYTHONPATH:+:$PYTHONPATH}"} $TSPRE "$vpy" "$script" "$arg" \
                     >/dev/null 2>"$errf"; } && tail -1 "$errf" | grep -Eo '^[0-9]+\.[0-9]+$' )"
         if [ -n "$secs" ]; then
           printf '%s\t%s\t%s\tOK\t%s\n' "$name" "$cname" "$t" "$secs" >> "$tsv"
-          printf '    %-14s %-14s trial %s: %ss\n' "$name" "$cname" "$t" "$secs"
+          printf '    %-14s %-14s trial %s: %ss%s\n' "$name" "$cname" "$t" "$secs" "$run_note"
         else
           printf '%s\t%s\t%s\tFAIL\t\n' "$name" "$cname" "$t" >> "$tsv"
           warn "$name/$cname trial $t FAILED (see $errf)"
@@ -1386,6 +1659,83 @@ run_static() {
 ###############################################################################
 # Suite D: pyperformance — 8-way (the four JIT modes × plain/static CPython).
 ###############################################################################
+# Preflight for Suite D: prove CinderX actually engages under the exact PYTHONPATH
+# + CINDERX_SITE_DIR + policy env each pyperformance worker will see, BEFORE the
+# long run. We launch the *base* interpreter that pyperformance's compat venv
+# wraps (python-install / python-install-static) -- which, like the compat venv,
+# has no cinderx on its default path -- with the minimal sitedir on PYTHONPATH.
+# A tiny probe reports whether cinderx loaded and whether the JIT is enabled, and
+# we assert that against each config's intent. $1 = minimal sitedir.
+verify_cinderx_engaged() {
+  local sitedir="$1"
+  log "Suite D preflight: verifying CinderX engagement per config"
+  # jit=1 means the JIT will actually compile code (auto-threshold armed OR a jit
+  # list is loaded). is_enabled() is unusable here: importing cinderx flips it on
+  # even in nojit mode, so nojit and auto would look identical.
+  local probe='import sys
+loaded = 1 if "cinderx" in sys.modules else 0
+jit = 0
+if loaded:
+    try:
+        import cinderx.jit as j
+        armed = j.get_compile_after_n_calls() is not None
+        listed = bool(j.get_jit_list() or [])
+        jit = 1 if (armed or listed) else 0
+    except Exception:
+        jit = 0
+print("PROBE loaded=%d jit=%d" % (loaded, jit))'
+  local cfgrow rc=0
+  for cfgrow in "${ALL_CONFIGS[@]}"; do
+    local cname kind cenv vpy basepy real_sp exp_loaded exp_jit
+    IFS='|' read -r cname kind cenv <<< "$cfgrow"
+    vpy="$(config_vpy "$kind")"
+    [ -x "$vpy" ] || { warn "  $cname: venv missing ($vpy); skipping preflight"; continue; }
+    # jitlist configs are skipped in the real loop when no lists exist; match that.
+    case "$cenv" in
+      BENCH_JITLIST_DIR=*)
+        ls "$JITLIST_DIR"/*.jitlist >/dev/null 2>&1 \
+          || { warn "  $cname: no jitlists; skipping preflight"; continue; } ;;
+    esac
+    case "$kind" in
+      plain)  basepy="$PY_PREFIX/bin/python3" ;;
+      static) basepy="$PY_PREFIX_STATIC/bin/python3" ;;
+      *)      warn "  $cname: unknown kind '$kind'"; rc=1; continue ;;
+    esac
+    [ -x "$basepy" ] || basepy="$vpy"   # fall back to the venv python if needed
+    real_sp="$("$vpy" -c 'import site; print(site.getsitepackages()[0])')" \
+      || { warn "  $cname: could not resolve site-packages"; rc=1; continue; }
+    # Expected engagement per config ('x' = don't-care). jitlist needs a bm_<name>
+    # argv to pick a list, which the preflight lacks, so we only assert it loads.
+    case "$cname" in
+      *-off)     exp_loaded=0; exp_jit=x ;;
+      *-nojit)   exp_loaded=1; exp_jit=0 ;;
+      *-auto)    exp_loaded=1; exp_jit=1 ;;
+      *-jitlist) exp_loaded=1; exp_jit=x ;;
+      *)         exp_loaded=x; exp_jit=x ;;
+    esac
+    local line got_loaded got_jit
+    line="$(env $cenv PYTHONPATH="$sitedir" CINDERX_SITE_DIR="$real_sp" \
+            "$basepy" -c "$probe" 2>/dev/null)" || true
+    got_loaded="$(printf '%s\n' "$line" | sed -n 's/.*loaded=\([0-9]\).*/\1/p')"
+    got_jit="$(printf '%s\n' "$line" | sed -n 's/.*jit=\([0-9]\).*/\1/p')"
+    if [ -z "$got_loaded" ]; then
+      warn "  $cname: probe produced no output (basepy=$basepy) -> FAIL"; rc=1; continue
+    fi
+    local okl=1 okj=1
+    { [ "$exp_loaded" = x ] || [ "$got_loaded" = "$exp_loaded" ]; } || okl=0
+    { [ "$exp_jit" = x ]    || [ "$got_jit" = "$exp_jit" ]; }       || okj=0
+    if [ "$okl" = 1 ] && [ "$okj" = 1 ]; then
+      ok "  $cname: loaded=$got_loaded jit=$got_jit (want loaded=$exp_loaded jit=$exp_jit)"
+    else
+      warn "  $cname: loaded=$got_loaded jit=$got_jit BUT want loaded=$exp_loaded jit=$exp_jit -> FAIL"
+      rc=1
+    fi
+  done
+  [ "$rc" = 0 ] && ok "Preflight passed: CinderX engages as configured" \
+                || warn "Preflight detected configs where CinderX does NOT engage as intended"
+  return $rc
+}
+
 run_pyperf() {
   [ "$RUN_PYPERF" -eq 1 ] || { warn "Skipping suite D (pyperformance)"; return; }
   log "Suite D: pyperformance (8-way), mode=${PYPERF_MODE:-steady}"
@@ -1402,8 +1752,28 @@ run_pyperf() {
   local inherit="CINDERX_DISABLE,CINDERX_NO_JIT,BENCH_JITLIST_DIR,BENCH_JITLIST_FALLBACK"
   inherit="$inherit,http_proxy,https_proxy,no_proxy,HTTP_PROXY,HTTPS_PROXY,NO_PROXY"
   inherit="$inherit,PIP_INDEX_URL,PIP_EXTRA_INDEX_URL,PIP_TRUSTED_HOST,PIP_CACHE_DIR,PIP_CONFIG_FILE"
+  # The CinderX policy only takes effect if sitecustomize.py runs in the actual
+  # benchmark worker -- but pyperformance runs benchmarks in an isolated compat
+  # venv that has neither our sitecustomize nor cinderx. Fix: put a minimal dir
+  # containing only sitecustomize.py on PYTHONPATH (so it is imported by the
+  # worker) and point CINDERX_SITE_DIR at the config's real venv site-packages so
+  # sitecustomize can site.addsitedir() it (appends -> no shadowing; processes
+  # .pth -> static cinderx works). PYTHONPATH is already whitelisted by pyperf's
+  # create_environ; CINDERX_SITE_DIR + the banner vars must be inherited too.
+  inherit="$inherit,CINDERX_SITE_DIR,BENCH_CINDERX_BANNER,BENCH_CINDERX_BANNER_FILE,PYTHONPATH"
   local common="--benchmarks $PYPERF_BENCHES $aff_opt \
     --inherit-environ $inherit --timeout 600"
+
+  # Minimal PYTHONPATH dir: just a copy of sitecustomize.py (nothing else, to
+  # avoid putting a full site-packages ahead of the stdlib on sys.path).
+  local sitedir="$WORKDIR/pyperf-sitedir"
+  mkdir -p "$sitedir"
+  cp "$HELPERS/sitecustomize.py" "$sitedir/sitecustomize.py" \
+    || die "could not stage sitecustomize.py into $sitedir"
+  rm -rf "$sitedir/__pycache__" 2>/dev/null || true
+
+  # Preflight: prove CinderX actually engages per config BEFORE the long run.
+  verify_cinderx_engaged "$sitedir" || die "CinderX engagement preflight failed (see above)"
 
   local cfgrow pairs=()
   for cfgrow in "${ALL_CONFIGS[@]}"; do
@@ -1418,10 +1788,32 @@ run_pyperf() {
           || { warn "No JIT lists available; skipping config $cname"; continue; } ;;
     esac
     local out="${tag}_${cname}.json"
+    # Real venv site-packages for this config -> where cinderx + sitecustomize
+    # actually live; sitecustomize will site.addsitedir() it in the worker.
+    local real_sp
+    real_sp="$("$vpy" -c 'import site; print(site.getsitepackages()[0])')" \
+      || { warn "could not resolve site-packages for $cname; skipping"; continue; }
+    local wlog="$LOGDIR/cinderx_workers_${cname}.log"
+    : > "$wlog"
     log "  $cname ${cenv:+($cenv)}"
-    env $cenv "$vpy" -m pyperformance run $PYPERF_MODE $common \
+    env $cenv \
+        PYTHONPATH="$sitedir${PYTHONPATH:+:$PYTHONPATH}" \
+        CINDERX_SITE_DIR="$real_sp" \
+        BENCH_CINDERX_BANNER=1 \
+        BENCH_CINDERX_BANNER_FILE="$wlog" \
+        "$vpy" -m pyperformance run $PYPERF_MODE $common \
       -o "$out" >"$LOGDIR/pyperf_${cname}.log" 2>&1 || warn "$cname run had errors (see log)"
     [ -f "$out" ] && pairs+=("$cname=$out")
+    # Runtime proof from the actual workers (banner appended by sitecustomize).
+    if [ -s "$wlog" ]; then
+      local nworkers modes
+      nworkers="$(wc -l < "$wlog")"
+      modes="$(sort -u "$wlog" | sed 's/ pid=[0-9]*//; s/ bench=[^ ]*//' | sort -u \
+               | sed 's/^cinderx-banner: //' | paste -sd'; ' -)"
+      ok "    workers=$nworkers cinderx-banner[$cname]: $modes"
+    else
+      warn "    $cname: NO cinderx banner recorded -> sitecustomize did NOT run in workers!"
+    fi
   done
 
   # Build the 8-way TSV from the per-config pyperf JSONs (mean per benchmark) and
