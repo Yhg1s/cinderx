@@ -93,6 +93,18 @@ PYPERF_BENCHES="${PYPERF_BENCHES:-richards,richards_super,spectral_norm,chaos,de
 # fastmark work-scale factor (lower = faster; 100 is fastmark's default).
 FASTMARK_SCALE="${FASTMARK_SCALE:-100}"
 
+# BOLT post-link optimization (opt-in via --bolt). BOLT rewrites each interpreter
+# binary's code layout from profile data (basic-block/function reordering, cold
+# splitting), directly targeting the ±10% binary-layout effect the foobar7/8
+# analysis measured between the plain and static builds. Off by default: it adds
+# build time and needs llvm-bolt (+ merge-fdata). When enabled, CPython is linked
+# with -Wl,--emit-relocs so BOLT can run in relocation mode (required for function
+# reordering); the static relink inherits that flag via configure's LDFLAGS.
+DO_BOLT="${DO_BOLT:-0}"
+# Representative pyperformance benchmarks used to collect the BOLT profile — short
+# but they exercise the interpreter-core hot paths. Override with --bolt-benches.
+BOLT_BENCHES="${BOLT_BENCHES:-richards,raytrace,deltablue}"
+
 # ---------------------------------------------------------------------------
 # Derived paths.
 # ---------------------------------------------------------------------------
@@ -205,12 +217,28 @@ RUN TUNING:
   --jit-threshold N      gen_jitlist hot threshold            (default: 2)
   --jit-budget SECS      gen_jitlist workload budget          (default: 3.0)
 
+BOLT POST-LINK OPTIMIZATION (optional):
+  --bolt                 After building each interpreter, run LLVM BOLT to rewrite
+                        its code layout from a profile (basic-block + function
+                        reordering, cold-code splitting). This directly targets the
+                        ±10% binary-layout effect measured between the plain and
+                        static builds. OFF by default (adds build time; needs
+                        llvm-bolt + merge-fdata on PATH). When enabled, CPython is
+                        linked with -Wl,--emit-relocs so BOLT can reorder functions
+                        (relocation mode); the static relink inherits that flag. If
+                        llvm-bolt is absent, or a reused binary lacks relocations,
+                        BOLT is skipped with a warning (the build still completes).
+  --no-bolt              Explicitly disable BOLT (the default).
+  --bolt-benches LIST    Comma-separated pyperformance benchmarks used to collect
+                        the BOLT profile (default: richards,raytrace,deltablue).
+
   -h, --help             Show this help and exit.
 
 ENVIRONMENT VARIABLES:
   Every option above has a matching env var (CPYTHON_TAG, CINDERX_VERSION,
   WORKDIR, JOBS, AFFINITY, TRIALS, PYPERF_MODE, PYPERF_BENCHES, FASTMARK_SCALE,
-  JIT_THRESHOLD, JIT_BUDGET, ...). CLI flags take precedence over env vars.
+  JIT_THRESHOLD, JIT_BUDGET, DO_BOLT, BOLT_BENCHES, ...). CLI flags take
+  precedence over env vars.
   WORKDIR is required: set it via --workdir or the $WORKDIR env var (no default).
   CINDERX_CC / CINDERX_CXX override the auto-detected compiler used for BOTH
   CPython and the CinderX archives (the --cc / --cxx flags take precedence over
@@ -230,6 +258,7 @@ EXAMPLES:
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --affinity 8-11 --trials 5
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --only-bench --skip-jitlists
+  bash cinderx-benchmark.sh --workdir ~/cinderx-bench --bolt   # BOLT both binaries
   CPYTHON_TAG=v3.14.5 bash cinderx-benchmark.sh --workdir ~/cinderx-bench --cinderx-version 2026.6.25.0
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --cinderx-source --cinderx-tag main
   WORKDIR=~/cinderx-bench bash cinderx-benchmark.sh --affinity 8-11 --skip-fastmark
@@ -251,6 +280,9 @@ while [ $# -gt 0 ]; do
     --skip-pyperf)        RUN_PYPERF=0 ;;
     --only-bench)         DO_BUILD_CPYTHON=0; DO_INSTALL_CINDERX=0; DO_VENV=0 ;;
     --regen-jitlists)     REGEN_JITLISTS=1 ;;
+    --bolt)               DO_BOLT=1 ;;
+    --no-bolt)            DO_BOLT=0 ;;
+    --bolt-benches)       BOLT_BENCHES="$2"; shift ;;
     --cinderx-source)     CINDERX_SOURCE=1 ;;
     --cpython-tag)        CPYTHON_TAG="$2"; shift ;;
     --cpython-repo)       CPYTHON_REPO="$2"; shift ;;
@@ -372,6 +404,26 @@ preflight() {
     fi
   else
     warn "No suitable C++20 compiler (gcc 13+ or clang) found; required to build the static CPython"; missing=1
+  fi
+
+  # BOLT (opt-in): check llvm-bolt availability. If it is missing we DISABLE BOLT
+  # here (rather than failing) so the rest of the pipeline still runs — and so
+  # build_cpython does NOT add -Wl,--emit-relocs (which would otherwise bloat the
+  # binary for a BOLT pass that can never happen). Preflight runs before the build,
+  # so this decision propagates correctly.
+  if [ "$DO_BOLT" -eq 1 ]; then
+    if command -v llvm-bolt >/dev/null 2>&1; then
+      ok "BOLT enabled: llvm-bolt found ($(llvm-bolt --version 2>&1 | sed -n 's/.*LLVM version/LLVM/p;q'))"
+      if ! command -v merge-fdata >/dev/null 2>&1; then
+        warn "merge-fdata not found (ships with LLVM BOLT); multi-benchmark BOLT profiles cannot be merged — a single profile will be used instead."
+      fi
+      if ! command -v readelf >/dev/null 2>&1 && ! command -v llvm-readelf >/dev/null 2>&1; then
+        warn "readelf/llvm-readelf not found; cannot verify -Wl,--emit-relocs before BOLT (BOLT will be attempted regardless)."
+      fi
+    else
+      warn "llvm-bolt not found on PATH; --bolt requested but BOLT will be SKIPPED. Install LLVM BOLT (e.g. distro 'bolt'/'llvm' package) and re-run."
+      DO_BOLT=0
+    fi
   fi
 
   [ "$missing" -eq 0 ] || die "Missing prerequisites above. Install them and re-run."
@@ -817,6 +869,17 @@ build_cpython() {
   local cc_args=()
   [ -n "$TOOLCHAIN_CC" ]  && cc_args+=("CC=$TOOLCHAIN_CC")
   [ -n "$TOOLCHAIN_CXX" ] && cc_args+=("CXX=$TOOLCHAIN_CXX")
+  # When BOLT is enabled, link with -Wl,--emit-relocs so llvm-bolt can run in
+  # relocation mode (required for function reordering / cold splitting). configure
+  # records LDFLAGS into the Makefile, so both the PGO `make` here AND the static
+  # `make python` relink (build_static_cpython) inherit the flag — the static
+  # binary therefore also carries relocations for its own BOLT pass. Any existing
+  # $LDFLAGS is preserved.
+  local extra_conf=()
+  if [ "$DO_BOLT" -eq 1 ]; then
+    extra_conf+=("LDFLAGS=-Wl,--emit-relocs${LDFLAGS:+ $LDFLAGS}")
+    log "BOLT enabled: linking CPython with -Wl,--emit-relocs (BOLT relocation mode)"
+  fi
   if [ "${#cc_args[@]}" -gt 0 ]; then
     log "Configuring CPython with PGO + LTO and ${cc_args[*]}"
   else
@@ -824,7 +887,7 @@ build_cpython() {
   fi
   ( cd "$SRC_CPYTHON" \
     && ./configure --prefix="$PY_PREFIX" --enable-optimizations --with-lto \
-         "${cc_args[@]}" \
+         "${cc_args[@]}" "${extra_conf[@]}" \
          >"$LOGDIR/cpython_configure.log" 2>&1 ) \
     || die "CPython configure failed (see $LOGDIR/cpython_configure.log)"
 
@@ -1405,6 +1468,183 @@ gen_jitlists() {
 }
 
 ###############################################################################
+# Phase 4b: BOLT post-link optimization of the interpreter binaries (opt-in).
+#
+# BOLT (LLVM Binary Optimization and Layout Tool) rewrites an already-linked
+# binary using profile data: it reorders basic blocks (ext-tsp), reorders whole
+# functions (cdsort) and splits cold code out of the hot path — exactly the code
+# placement that the foobar7/8 analysis showed accounts for ±10% of the
+# plain-vs-static gap. We optimize BOTH interpreters in place; because the venvs
+# reference the install-prefix python via symlink, swapping the binary makes every
+# subsequent benchmark run use the BOLT-optimized interpreter automatically.
+#
+# Profiling method: INSTRUMENTATION (llvm-bolt -instrument), not perf/perf2bolt.
+# Rationale: (1) it needs no perf_event_paranoid relaxation or root; (2) the
+# function-reordering/splitting we want requires BOLT's relocation mode either
+# way, which we already provide via -Wl,--emit-relocs at link time (see
+# build_cpython) — so perf2bolt would offer no advantage here. Each binary gets
+# its OWN profile (their hot paths differ). We profile with CINDERX_DISABLE=1 so
+# both binaries get a clean, comparable interpreter-core profile: JIT-compiled
+# code is generated at runtime and lives outside the ELF, so BOLT cannot touch it
+# regardless — the win is in the interpreter/runtime C code layout.
+###############################################################################
+
+# readelf shim: prefer binutils readelf, fall back to llvm-readelf. Returns 127
+# if neither exists (callers treat that as "cannot verify").
+bolt_readelf() {
+  if command -v readelf >/dev/null 2>&1; then readelf "$@"
+  elif command -v llvm-readelf >/dev/null 2>&1; then llvm-readelf "$@"
+  else return 127; fi
+}
+
+# BOLT-optimize one interpreter binary IN PLACE.
+#   $1 = install prefix (…/python-install or …/python-install-static)
+#   $2 = a venv python that has pyperformance installed (for the profile workload)
+#   $3 = label ("plain" / "static")
+# Best-effort: any failure leaves the ORIGINAL binary untouched (a .prebolt backup
+# is kept once we start swapping) and returns without aborting the pipeline.
+bolt_one() {
+  local prefix="$1" venv="$2" label="$3"
+  local py="$prefix/bin/python3"
+  [ -x "$py" ] || { warn "BOLT[$label]: no interpreter at $prefix; skipping"; return 0; }
+
+  local pyver bin
+  pyver="$("$py" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" \
+    || { warn "BOLT[$label]: could not determine python version; skipping"; return 0; }
+  bin="$(readlink -f "$prefix/bin/python$pyver" 2>/dev/null)"
+  [ -n "$bin" ] && [ -f "$bin" ] || { warn "BOLT[$label]: real binary python$pyver not found; skipping"; return 0; }
+
+  # Idempotent: a marker next to the binary records a completed BOLT pass.
+  if [ -f "$bin.bolt-done" ]; then
+    ok "BOLT[$label]: $bin already optimized; skipping"
+    return 0
+  fi
+
+  # Relocation mode (function reordering) needs -Wl,--emit-relocs -> a .rela.text
+  # section survives in the binary. Verify when we can; if the binary was reused
+  # from a non-BOLT build it will be missing and we skip gracefully.
+  if bolt_readelf -S "$bin" >/dev/null 2>&1; then
+    if ! bolt_readelf -S "$bin" 2>/dev/null | grep -qE '\.rela?\.text'; then
+      warn "BOLT[$label]: $bin has no .rela.text (linked without -Wl,--emit-relocs)."
+      warn "  It was likely built without --bolt. Remove $prefix and re-run with --bolt to rebuild with relocations; BOLT skipped for now."
+      return 0
+    fi
+  else
+    warn "BOLT[$label]: cannot verify relocations (no readelf); attempting BOLT anyway."
+  fi
+
+  # Locate the pyperformance benchmark scripts + this venv's site-packages so the
+  # (standalone) instrumented binary can import pyperf and the benchmark modules.
+  local pp bench_d sp
+  pp="$("$venv" -c 'import pyperformance,os;print(os.path.dirname(pyperformance.__file__))' 2>/dev/null)" \
+    || { warn "BOLT[$label]: pyperformance not importable in $venv; cannot build a profile — skipping"; return 0; }
+  bench_d="$pp/data-files/benchmarks"
+  sp="$("$venv" -c 'import site;print(site.getsitepackages()[0])' 2>/dev/null)" \
+    || { warn "BOLT[$label]: could not resolve site-packages for $venv; skipping"; return 0; }
+
+  local prof="$WORKDIR/bolt/$label"
+  rm -rf "$prof"; mkdir -p "$prof"
+  local inst="$bin.inst"
+  local TSPRE; TSPRE="$(taskset_prefix)"
+
+  # 1) Instrument. --instrumentation-file-append-pid gives one .fdata per process
+  #    so multiple benchmark runs accumulate instead of overwriting.
+  log "BOLT[$label]: instrumenting $bin"
+  if ! llvm-bolt "$bin" -instrument \
+        --instrumentation-file="$prof/prof.fdata" \
+        --instrumentation-file-append-pid \
+        -o "$inst" >"$LOGDIR/bolt_${label}_instrument.log" 2>&1; then
+    warn "BOLT[$label]: instrumentation failed (see $LOGDIR/bolt_${label}_instrument.log); original binary kept"
+    rm -f "$inst"
+    return 0
+  fi
+
+  # 2) Run the representative workload with the instrumented binary. CINDERX_DISABLE=1
+  #    keeps the profile to the interpreter core; PYTHONPATH exposes pyperf.
+  local ran=0 b
+  local OLDIFS="$IFS"; IFS=','
+  for b in $BOLT_BENCHES; do
+    IFS="$OLDIFS"
+    local bm="$bench_d/bm_$b/run_benchmark.py"
+    if [ ! -f "$bm" ]; then warn "BOLT[$label]: no pyperformance bm_$b for profiling; skipping it"; IFS=','; continue; fi
+    log "BOLT[$label]: profiling with bm_$b"
+    if env CINDERX_DISABLE=1 PYTHONPATH="$sp" $TSPRE "$inst" "$bm" --worker -l 1 -w 0 -n 1 \
+         >"$LOGDIR/bolt_${label}_run_$b.log" 2>&1; then
+      ran=$((ran + 1))
+    else
+      warn "BOLT[$label]: profiling run bm_$b failed (see $LOGDIR/bolt_${label}_run_$b.log)"
+    fi
+    IFS=','
+  done
+  IFS="$OLDIFS"
+
+  if [ "$ran" -eq 0 ]; then
+    warn "BOLT[$label]: no profiling workload ran; BOLT skipped, original binary kept"
+    rm -f "$inst"
+    return 0
+  fi
+
+  # 3) Merge the per-process profiles into one fdata (merge-fdata ships with BOLT).
+  local fdata=( "$prof"/prof.fdata* )
+  if [ ! -e "${fdata[0]}" ]; then
+    warn "BOLT[$label]: instrumented run produced no .fdata; BOLT skipped, original kept"
+    rm -f "$inst"
+    return 0
+  fi
+  local merged="$prof/merged.fdata"
+  if command -v merge-fdata >/dev/null 2>&1; then
+    if ! merge-fdata "${fdata[@]}" > "$merged" 2>"$LOGDIR/bolt_${label}_merge.log"; then
+      warn "BOLT[$label]: merge-fdata failed (see $LOGDIR/bolt_${label}_merge.log); BOLT skipped, original kept"
+      rm -f "$inst"
+      return 0
+    fi
+  elif [ "${#fdata[@]}" -eq 1 ]; then
+    merged="${fdata[0]}"
+  else
+    warn "BOLT[$label]: merge-fdata unavailable and ${#fdata[@]} profiles present; using only the first"
+    merged="${fdata[0]}"
+  fi
+
+  # 4) Optimize using the profile.
+  local opt="$bin.bolt"
+  log "BOLT[$label]: optimizing (reorder-blocks=ext-tsp, reorder-functions=cdsort, split-functions, split-all-cold)"
+  if ! llvm-bolt "$bin" -o "$opt" -data="$merged" \
+        -reorder-blocks=ext-tsp -reorder-functions=cdsort \
+        -split-functions -split-all-cold -dyno-stats \
+        >"$LOGDIR/bolt_${label}_optimize.log" 2>&1; then
+    warn "BOLT[$label]: optimization failed (see $LOGDIR/bolt_${label}_optimize.log); original binary kept"
+    rm -f "$inst" "$opt"
+    return 0
+  fi
+
+  # 5) Swap in the optimized binary (backup the original first) and smoke-test it.
+  cp -f "$bin" "$bin.prebolt" || { warn "BOLT[$label]: could not back up original; keeping original, skipping swap"; rm -f "$inst" "$opt"; return 0; }
+  if ! cp -f "$opt" "$bin"; then
+    warn "BOLT[$label]: could not install optimized binary; restoring original"
+    cp -f "$bin.prebolt" "$bin"
+    rm -f "$inst" "$opt"
+    return 0
+  fi
+  if ! "$py" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
+    warn "BOLT[$label]: optimized binary fails to run; restoring original"
+    cp -f "$bin.prebolt" "$bin"
+    rm -f "$inst" "$opt" "$bin.bolt-done"
+    return 0
+  fi
+  : > "$bin.bolt-done"
+  rm -f "$inst"
+  ok "BOLT[$label]: $bin optimized (original backed up at $bin.prebolt; dyno-stats in $LOGDIR/bolt_${label}_optimize.log)"
+  return 0
+}
+
+bolt_optimize() {
+  [ "$DO_BOLT" -eq 1 ] || return 0
+  log "BOLT: post-link optimization of both interpreter binaries (benches=$BOLT_BENCHES)"
+  bolt_one "$PY_PREFIX"        "$VPY"        "plain"
+  bolt_one "$PY_PREFIX_STATIC" "$VPY_STATIC" "static"
+}
+
+###############################################################################
 # Suite A: built-in lightweight benchmarks — 8-way.
 ###############################################################################
 run_builtin() {
@@ -1893,6 +2133,14 @@ write_summary() {
     echo "- **Dynamic CinderX:** ${dyn_ver:-unknown} (wheel in \`$VENV\`)"
     echo "- **Static CinderX:** ${static_ver:-unknown} (builtin _cinderx + PythonLib in \`$VENV_STATIC\`)"
     echo "- **Affinity:** ${AFFINITY:-none}   **Trials:** $TRIALS   **pyperf mode:** ${PYPERF_MODE:-steady-state}"
+    if [ "$DO_BOLT" -eq 1 ]; then
+      local bolt_plain="no" bolt_static="no"
+      [ -f "$(readlink -f "$PY_PREFIX/bin/python3" 2>/dev/null).bolt-done" ] 2>/dev/null && bolt_plain="yes"
+      [ -f "$(readlink -f "$PY_PREFIX_STATIC/bin/python3" 2>/dev/null).bolt-done" ] 2>/dev/null && bolt_static="yes"
+      echo "- **BOLT:** enabled (profile benches=\`$BOLT_BENCHES\`) — plain optimized: $bolt_plain, static optimized: $bolt_static"
+    else
+      echo "- **BOLT:** disabled (pass \`--bolt\` to enable post-link binary-layout optimization)"
+    fi
     echo "- **Generated:** $(date)"
     echo
     echo "## Configurations"
@@ -1949,6 +2197,7 @@ main() {
   install_cinderx            # dynamic wheel into the plain venv (configs 2-4)
   install_cinderx_pythonlib  # PythonLib .pth into the static venv (configs 6-8)
   gen_jitlists               # generated once with the plain venv; shared by both
+  bolt_optimize              # (opt-in --bolt) BOLT-optimize both interpreters in place
   run_builtin
   run_fastmark
   run_static
