@@ -65,7 +65,6 @@ CINDERX_CXX="${CINDERX_CXX:-}"                  # override C++ compiler for CPyt
 # flags are used (CLI beats env). Empty => not explicitly provided => auto-detect.
 CC_ORIGIN=""; [ -n "$CINDERX_CC" ] && CC_ORIGIN="env var CINDERX_CC"
 CXX_ORIGIN=""; [ -n "$CINDERX_CXX" ] && CXX_ORIGIN="env var CINDERX_CXX"
-CINDERX_LIBSTDCXX_A="${CINDERX_LIBSTDCXX_A:-}"  # override static libstdc++.a fallback path (default: ask the C++ compiler via -print-file-name)
 
 WORKDIR="${WORKDIR:-}"                          # REQUIRED: root for everything. No default — pass --workdir DIR (or set $WORKDIR).
 JOBS="${JOBS:-$(nproc)}"                       # make -j parallelism
@@ -126,8 +125,8 @@ VPY_STATIC=""    # static venv python
 
 # Populated by detect_toolchain(): a single C++20 toolchain used to build BOTH
 # CPython (./configure CC=/CXX=) and the CinderX archives, so their libstdc++/ABI
-# match. TOOLCHAIN_LIBSTDCXX is a static libstdc++.a kept only as a link fallback.
-TOOLCHAIN_CC=""; TOOLCHAIN_CXX=""; TOOLCHAIN_LIBSTDCXX=""
+# match.
+TOOLCHAIN_CC=""; TOOLCHAIN_CXX=""
 
 # ---------------------------------------------------------------------------
 # Pretty logging.
@@ -242,8 +241,7 @@ ENVIRONMENT VARIABLES:
   WORKDIR is required: set it via --workdir or the $WORKDIR env var (no default).
   CINDERX_CC / CINDERX_CXX override the auto-detected compiler used for BOTH
   CPython and the CinderX archives (the --cc / --cxx flags take precedence over
-  them); CINDERX_LIBSTDCXX_A overrides the static libstdc++.a fallback path used
-  when relinking the static interpreter.
+  them).
 
 OUTPUT:
   Results, logs and markdown reports are written under  <workdir>/results/ .
@@ -397,11 +395,6 @@ preflight() {
     ok "Toolchain (CPython + CinderX): CC=$_cc  CXX=$TOOLCHAIN_CXX"
     ok "  CC  version: $("$_cc" --version 2>&1 | head -1)"
     ok "  CXX version: $("$TOOLCHAIN_CXX" --version 2>&1 | head -1)"
-    if [ -n "$TOOLCHAIN_LIBSTDCXX" ]; then
-      ok "Static libstdc++ fallback present: $TOOLCHAIN_LIBSTDCXX (used only if the default dynamic -lstdc++ link fails)"
-    else
-      warn "No static libstdc++.a found; the static link will use dynamic -lstdc++ only (matching compiler should make this safe)"
-    fi
   else
     warn "No suitable C++20 compiler (gcc 13+ or clang) found; required to build the static CPython"; missing=1
   fi
@@ -717,7 +710,14 @@ table with one column per configuration plus a geomean-speedup row.
 Usage: report_8way.py <tsv> <title> <out.md> <config1,config2,...>
 The first config in the list is the baseline; speedup = baseline / config
 (>1 = that config is faster than the baseline). Cell = best (min) seconds over
-trials (lower = better)."""
+trials (lower = better).
+
+Each non-baseline cell shows the best time in auto-selected units (s / ms / μs)
+plus its % difference in wall-clock time vs the baseline column, e.g.
+"456 ms (-5.2%)" (negative = faster than baseline, positive = slower). The
+baseline column shows just the time. The geomean row shows the geometric mean of
+the per-benchmark speedup ratios (baseline / config), computed from the raw
+unrounded times so sub-second benchmarks are never flushed to zero first."""
 import csv, sys, statistics, collections, math
 
 tsv, title, out, config_csv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -739,24 +739,53 @@ def best(name, cfg):
     return min(xs) if xs else None
 
 
+def fmt_time(sec):
+    """Format seconds with an auto-selected unit and ~3 significant figures, so
+    fast sub-second benchmarks never render as '0.00'."""
+    if sec >= 1.0:
+        val, unit = sec, "s"
+    elif sec >= 1e-3:
+        val, unit = sec * 1e3, "ms"
+    else:
+        val, unit = sec * 1e6, "μs"   # microseconds
+    if val >= 100:
+        num = f"{val:.0f}"
+    elif val >= 10:
+        num = f"{val:.1f}"
+    else:
+        num = f"{val:.2f}"
+    return f"{num} {unit}"
+
+
+def fmt_cell(v, b, is_baseline):
+    """Cell text: time (+ % time-difference vs baseline for non-baseline cols)."""
+    if v is None:
+        return "—"
+    if is_baseline or not b:
+        return fmt_time(v)
+    pct = (v - b) / b * 100.0
+    return f"{fmt_time(v)} ({pct:+.1f}%)"
+
+
 header = "| Benchmark | " + " | ".join(configs) + " |"
 sep = "|" + "---|" * (len(configs) + 1)
 lines = [f"# {title}\n",
-         "Cell = best (min) wall-clock seconds over trials (lower = better). "
-         f"Baseline = `{baseline}`; the geomean row shows speedup vs the "
-         "baseline (>1× = faster than baseline).\n",
+         "Cell = best (min) wall-clock time over trials (lower = better), in "
+         "auto-selected units (s / ms / μs). "
+         f"Baseline = `{baseline}`; non-baseline cells append the % time "
+         "difference vs baseline (negative = faster). The geomean row shows "
+         "speedup vs the baseline (>1× = faster than baseline).\n",
          header, sep]
 
+# Speedup ratios are accumulated from the raw unrounded times (baseline / config)
+# so the geometric mean is correct even for sub-second benchmarks.
 ratios = {c: [] for c in configs}
 for name in order:
     b = best(name, baseline)
     cells = []
     for c in configs:
         v = best(name, c)
-        if v is None:
-            cells.append("—")
-            continue
-        cells.append(f"{v:.3f}")
+        cells.append(fmt_cell(v, b, c == baseline))
         if b and v and c != baseline:
             ratios[c].append(b / v)
     lines.append("| " + name + " | " + " | ".join(cells) + " |")
@@ -863,8 +892,8 @@ build_cpython() {
   fi
 
   # Build CPython with the SAME compiler we use for the CinderX archives so their
-  # libstdc++ versions match (this is what removes the static libstdc++.a need).
-  # configure records CC/CXX in the Makefile, so the subsequent make uses them too.
+  # libstdc++ versions match. configure records CC/CXX in the Makefile, so the
+  # subsequent make uses them too.
   detect_toolchain
   local cc_args=()
   [ -n "$TOOLCHAIN_CC" ]  && cc_args+=("CC=$TOOLCHAIN_CC")
@@ -962,13 +991,11 @@ cxx_supports_cxx20() {
 # Detect ONE C++20 compiler (and its sibling C compiler) to build BOTH CPython
 # and the CinderX archives with. Using the same toolchain for both keeps their
 # libstdc++ versions in lockstep, which is what lets us link the C++ runtime
-# dynamically (-lstdc++) instead of bundling a static libstdc++.a. Populates
-# TOOLCHAIN_CC / TOOLCHAIN_CXX, plus TOOLCHAIN_LIBSTDCXX (a static libstdc++.a
-# kept only as a fallback for the static link, used if dynamic linking fails).
+# dynamically (-lstdc++). Populates TOOLCHAIN_CC / TOOLCHAIN_CXX.
 #
 # Everything here is generic: no hardcoded toolchain paths, so it works on any
 # Linux (Ubuntu/Debian system gcc, Fedora/RHEL gcc-toolset on PATH, clang, etc.).
-# Honours CINDERX_CXX / CINDERX_CC / CINDERX_LIBSTDCXX_A overrides in all modes.
+# Honours CINDERX_CXX / CINDERX_CC overrides in all modes.
 # Validate an explicitly-provided compiler (via --cc/--cxx or CINDERX_CC/CINDERX_CXX)
 # exists and is executable. Accepts a full path (e.g. /opt/gcc-15/bin/gcc, checked
 # with -x) or a bare command name resolved on PATH (via command -v). $3 is a label
@@ -1008,16 +1035,6 @@ detect_toolchain() {
     done
   fi
 
-  if [ -n "$CINDERX_LIBSTDCXX_A" ]; then
-    TOOLCHAIN_LIBSTDCXX="$CINDERX_LIBSTDCXX_A"
-  elif [ -n "$TOOLCHAIN_CXX" ]; then
-    # Ask the chosen compiler where its own static libstdc++.a lives. This is
-    # portable across distros and toolchains. If the static lib is not installed
-    # the compiler just echoes back the bare name, so confirm it is a real file.
-    local cand
-    cand="$("$TOOLCHAIN_CXX" -print-file-name=libstdc++.a 2>/dev/null)"
-    [ -n "$cand" ] && [ -f "$cand" ] && TOOLCHAIN_LIBSTDCXX="$cand"
-  fi
   return 0
 }
 
@@ -1133,55 +1150,36 @@ CPPEOF
       >"$LOGDIR/static_wrapper_compile.log" 2>&1 \
     || die "wrapper compile failed (see $LOGDIR/static_wrapper_compile.log)"
 
-  # Declare _cinderx as a builtin static module in Modules/Setup.local. The
-  # archives are wrapped in --start-group/--end-group to resolve their circular
-  # references; the static libstdc++.a (if found) goes inside the group so the
-  # C++ runtime is linked in statically. -lz/-lm satisfy CinderX's deps.
-  # Link the builtin _cinderx. Because CPython and the CinderX archives are now
-  # built with the SAME compiler (detect_toolchain), their libstdc++ versions
-  # match, so we link the C++ runtime DYNAMICALLY (-lstdc++) by default. Only if
-  # that link fails do we fall back to bundling the static libstdc++.a inside the
-  # archive group. The archives are wrapped in --start-group/--end-group for their
-  # circular references; -lz/-lm satisfy CinderX's deps.
-  local link_modes=(dynamic)
-  [ -n "$TOOLCHAIN_LIBSTDCXX" ] && link_modes+=(static)   # fallback only
+  # Declare _cinderx as a builtin static module in Modules/Setup.local. Because
+  # CPython and the CinderX archives are built with the SAME compiler
+  # (detect_toolchain), their libstdc++ versions match, so we link the C++ runtime
+  # dynamically (-lstdc++). The archives are wrapped in --start-group/--end-group
+  # to resolve their circular references; -lz/-lm satisfy CinderX's deps.
+  local a
+  log "Writing $SRC_CPYTHON/Modules/Setup.local"
+  {
+    echo "# Auto-generated by cinderx-benchmark.sh — statically link CinderX."
+    echo "# Wrapper .o (PyInit__cinderx) compiled out-of-band; archives from CinderX cmake."
+    echo "# Archives wrapped in --start-group/--end-group for their circular references."
+    printf '_cinderx %s -Wl,--start-group' "$wrapper_o"
+    for a in "${archives[@]}"; do printf ' %s' "$a"; done
+    printf ' -Wl,--end-group -lstdc++ -lz -lm\n'
+  } > "$SRC_CPYTHON/Modules/Setup.local"
 
-  local linked=0 mode a
-  for mode in "${link_modes[@]}"; do
-    log "Writing $SRC_CPYTHON/Modules/Setup.local (libstdc++: $mode)"
-    {
-      echo "# Auto-generated by cinderx-benchmark.sh — statically link CinderX."
-      echo "# Wrapper .o (PyInit__cinderx) compiled out-of-band; archives from CinderX cmake."
-      echo "# Archives wrapped in --start-group/--end-group for their circular references."
-      printf '_cinderx %s -Wl,--start-group' "$wrapper_o"
-      for a in "${archives[@]}"; do printf ' %s' "$a"; done
-      # static mode bundles libstdc++.a inside the group; dynamic links -lstdc++.
-      [ "$mode" = static ] && printf ' %s' "$TOOLCHAIN_LIBSTDCXX"
-      printf ' -Wl,--end-group'
-      [ "$mode" = dynamic ] && printf ' -lstdc++'
-      printf ' -lz -lm\n'
-    } > "$SRC_CPYTHON/Modules/Setup.local"
-
-    # Relink. Use `make python` (NOT plain `make`, which would redo the full PGO
-    # instrument+train pass). Editing Setup.local makes the Makefile regenerate
-    # itself on the first invocation; run again so the new config.c/_cinderx links.
-    log "Relinking CPython with the builtin _cinderx (make python -j$JOBS, libstdc++: $mode)"
+  # Relink. Use `make python` (NOT plain `make`, which would redo the full PGO
+  # instrument+train pass). Editing Setup.local makes the Makefile regenerate
+  # itself on the first invocation; run again so the new config.c/_cinderx links.
+  log "Relinking CPython with the builtin _cinderx (make python -j$JOBS)"
+  ( cd "$SRC_CPYTHON" && make python -j"$JOBS" ) \
+      >"$LOGDIR/static_make_python.log" 2>&1 || true
+  if ! "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null; then
+    log "  (re-running make python after Makefile regeneration)"
     ( cd "$SRC_CPYTHON" && make python -j"$JOBS" ) \
-        >"$LOGDIR/static_make_python.log" 2>&1 || true
-    if ! "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null; then
-      log "  (re-running make python after Makefile regeneration)"
-      ( cd "$SRC_CPYTHON" && make python -j"$JOBS" ) \
-          >>"$LOGDIR/static_make_python.log" 2>&1 || true
-    fi
-    if "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null; then
-      linked=1
-      ok "Linked builtin _cinderx (libstdc++: $mode)"
-      break
-    fi
-    warn "Relink with libstdc++:$mode failed (see $LOGDIR/static_make_python.log)"
-  done
-  [ "$linked" -eq 1 ] \
-    || die "could not link builtin _cinderx with dynamic or static libstdc++ (see $LOGDIR/static_make_python.log)"
+        >>"$LOGDIR/static_make_python.log" 2>&1 || true
+  fi
+  "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null \
+    || die "could not link builtin _cinderx (see $LOGDIR/static_make_python.log)"
+  ok "Linked builtin _cinderx"
 
   # Materialise the static interpreter in its OWN prefix: copy the entire plain
   # prefix (stdlib, headers, pip, ...) then swap in the freshly relinked binary.
