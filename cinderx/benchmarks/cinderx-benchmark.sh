@@ -1338,7 +1338,7 @@ install_cinderx() {
   "$VPY" -m pip install setuptools \
     >"$LOGDIR/cinderx_setuptools.log" 2>&1 || die "setuptools install failed"
   ( cd "$SRC_CINDERX" \
-    && env "${build_env[@]}" "$VPY" -m pip install -e . --no-build-isolation --reinstall \
+    && env "${build_env[@]}" "$VPY" -m pip install -e . --no-build-isolation --force-reinstall \
          >"$LOGDIR/cinderx_build.log" 2>&1 ) \
     || die "CinderX source build failed (see $LOGDIR/cinderx_build.log)"
 
