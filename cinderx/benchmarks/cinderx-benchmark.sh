@@ -13,9 +13,11 @@
 #      (the "static" CPython, with _cinderx as a builtin module). Only one PGO
 #      build runs — the static binary is a `make python` relink of the same tree.
 #   3. Create TWO benchmark virtualenvs (one per interpreter) and install
-#      pyperformance + the fastmark benchmark dependencies in both:
-#         - plain venv:  CinderX installed dynamically (PyPI wheel / source build)
+#      pyperformance + the fastmark benchmark dependencies in both. CinderX is
+#      built from source (with LTO) for BOTH interpreters — never a PyPI wheel:
+#         - plain venv:  CinderX built from source into a dynamic _cinderx.so
 #         - static venv: pure-Python cinderx package (PythonLib) via a .pth file
+#                        backed by the builtin _cinderx compiled in step 2
 #   4. Generate per-benchmark JIT lists once (shared by both interpreters).
 #   5. Run four benchmark suites, each across EIGHT configurations — the cross
 #      product of {plain, static} CPython and four JIT modes (off / no-jit /
@@ -56,8 +58,8 @@ CPYTHON_REPO="${CPYTHON_REPO:-https://github.com/python/cpython.git}"
 CPYTHON_TAG="${CPYTHON_TAG:-v3.14.5}"          # branch or tag to build
 CINDERX_REPO="${CINDERX_REPO:-https://github.com/facebookincubator/cinderx.git}"
 CINDERX_TAG="${CINDERX_TAG:-main}"             # only used with --cinderx-source
-CINDERX_VERSION="${CINDERX_VERSION:-}"         # pin a PyPI version, e.g. 2026.6.25.0 (empty = latest)
-CINDERX_SOURCE="${CINDERX_SOURCE:-0}"          # 1 = build CinderX from git instead of PyPI wheel (for the dynamic/plain venv)
+CINDERX_VERSION="${CINDERX_VERSION:-}"         # deprecated/ignored: CinderX is always built from source (no PyPI wheel)
+CINDERX_SOURCE="${CINDERX_SOURCE:-1}"          # retained for compat; the dynamic/plain venv now ALWAYS builds CinderX from source
 CINDERX_CC="${CINDERX_CC:-}"                    # override C compiler for CPython + CinderX (default: auto-detect); CLI: --cc
 CINDERX_CXX="${CINDERX_CXX:-}"                  # override C++ compiler for CPython + CinderX (default: auto-detect); CLI: --cxx
 # Where each compiler override came from, for validation error messages. Seeded
@@ -111,7 +113,7 @@ SRC_CPYTHON="$WORKDIR/cpython"
 SRC_CINDERX="$WORKDIR/cinderx"
 PY_PREFIX="$WORKDIR/python-install"                # plain CPython (no CinderX linked in)
 PY_PREFIX_STATIC="$WORKDIR/python-install-static"  # static CPython (builtin _cinderx)
-VENV="$WORKDIR/venv"                               # plain venv (dynamic CinderX wheel)
+VENV="$WORKDIR/venv"                               # plain venv (dynamic CinderX built from source)
 VENV_STATIC="$WORKDIR/venv-static"                 # static venv (PythonLib via .pth)
 RESULTS="$WORKDIR/results"
 JITLIST_DIR="$WORKDIR/jitlists/lists"
@@ -159,8 +161,9 @@ USAGE:
   --workdir is REQUIRED (there is no default work directory). It runs the entire
   pipeline: build the plain CPython (PGO+LTO),
   relink a second "static" CPython with _cinderx built in, create two benchmark
-  venvs (dynamic CinderX wheel + static PythonLib), generate JIT lists, then run
-  all four suites across all eight configurations and write reports.
+  venvs (dynamic CinderX built from source + static PythonLib), generate JIT
+  lists, then run all four suites across all eight configurations and write
+  reports. CinderX is always built from source (with LTO) — never a PyPI wheel.
 
 THE EIGHT CONFIGURATIONS (every suite runs each one):
   1. plain-off        plain CPython, CinderX not imported  (CINDERX_DISABLE=1)
@@ -189,10 +192,13 @@ if their output already exists):
 SOURCES / VERSIONS:
   --cpython-tag TAG      CPython git tag/branch to build      (default: v3.14.5)
   --cpython-repo URL     CPython git remote                   (default: github.com/python/cpython)
-  --cinderx-version VER  Pin a CinderX PyPI version (plain venv wheel) (default: latest)
-  --cinderx-source       Build the dynamic CinderX from a git checkout instead of PyPI.
-  --cinderx-repo URL     CinderX git remote (used for both static build and source build).
-  --cinderx-tag TAG      CinderX git tag/branch.
+  --cinderx-repo URL     CinderX git remote (used for BOTH the static and dynamic
+                        source builds).                       (default: github.com/facebookincubator/cinderx)
+  --cinderx-tag TAG      CinderX git tag/branch to build.     (default: main)
+  --cinderx-source       Accepted for backward compatibility, now a no-op: the
+                        dynamic CinderX is ALWAYS built from source.
+  --cinderx-version VER  Deprecated / ignored: CinderX is no longer installed from
+                        a PyPI wheel, so there is no version to pin.
 
 COMPILER / TOOLCHAIN:
   --cc PATH              C compiler for CPython + CinderX (full path or command
@@ -257,8 +263,8 @@ EXAMPLES:
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --affinity 8-11 --trials 5
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --only-bench --skip-jitlists
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --bolt   # BOLT both binaries
-  CPYTHON_TAG=v3.14.5 bash cinderx-benchmark.sh --workdir ~/cinderx-bench --cinderx-version 2026.6.25.0
-  bash cinderx-benchmark.sh --workdir ~/cinderx-bench --cinderx-source --cinderx-tag main
+  CPYTHON_TAG=v3.14.5 bash cinderx-benchmark.sh --workdir ~/cinderx-bench --cinderx-tag main
+  bash cinderx-benchmark.sh --workdir ~/cinderx-bench --cinderx-repo /path/to/cinderx --cinderx-tag main
   WORKDIR=~/cinderx-bench bash cinderx-benchmark.sh --affinity 8-11 --skip-fastmark
 USAGE
 }
@@ -328,7 +334,7 @@ STATIC_BUILD_DIR="$WORKDIR/cinderx-static-build"
 # The eight benchmark configurations.
 #
 # Each entry is  name|venv_kind|env_assignments  where:
-#   - venv_kind is "plain" (dynamic CinderX wheel) or "static" (builtin _cinderx).
+#   - venv_kind is "plain" (source-built dynamic _cinderx.so) or "static" (builtin _cinderx).
 #   - env_assignments is a (possibly empty) space-separated list of VAR=VALUE
 #     tokens passed through `env` to the benchmark process; the embedded
 #     sitecustomize.py interprets them to pick the CinderX/JIT policy.
@@ -811,7 +817,7 @@ PYEOF
   # The built-in benchmark scripts (binary_trees.py, ...) are downloaded source
   # we may not modify, and they do `import cinderx.jit` + `cinderx.jit.auto()`
   # UNCONDITIONALLY at module scope. On an interpreter that has no real cinderx
-  # (the plain venv when no dynamic CinderX wheel is installed) that import is a
+  # (the plain venv when the dynamic CinderX has not been built) that import is a
   # hard ModuleNotFoundError, so the benchmark can't even start.
   #
   # For the "off" configurations (CINDERX_DISABLE=1) we don't WANT the JIT anyway
@@ -1096,6 +1102,7 @@ build_static_cpython() {
       -DENABLE_INTERPRETER_LOOP=1 \
       -DENABLE_LAZY_IMPORTS=0 \
       -DENABLE_LIGHTWEIGHT_FRAMES=0 \
+      -DENABLE_LTO=ON \
       -DENABLE_PARALLEL_GC=0 \
       -DENABLE_PEP523_HOOK=1 \
       -DENABLE_PERF_TRAMPOLINE=0 \
@@ -1251,7 +1258,7 @@ create_one_venv() {
 }
 
 make_venvs() {
-  # Plain venv (dynamic CinderX wheel goes in later via install_cinderx).
+  # Plain venv (source-built dynamic CinderX goes in later via install_cinderx).
   if [ "$DO_VENV" -eq 0 ] && [ -x "$VENV/bin/python" ]; then
     VPY="$VENV/bin/python"; ok "Reusing existing plain venv $VENV"
   else
@@ -1279,10 +1286,12 @@ install_sitecustomize() {
 }
 
 ###############################################################################
-# Phase 3: install the dynamic CinderX into the PLAIN venv (PyPI wheel by
-# default, or built from a git checkout with --cinderx-source). The static venv
-# instead gets the pure-Python PythonLib via install_cinderx_pythonlib (its
-# native side is the builtin _cinderx in the static interpreter).
+# Phase 3: build the dynamic CinderX from source and install it into the PLAIN
+# venv (always a source build of _cinderx.so from $SRC_CINDERX with LTO — never a
+# pre-built PyPI wheel). The static venv instead gets the pure-Python PythonLib
+# via install_cinderx_pythonlib (its native side is the builtin _cinderx in the
+# static interpreter, also compiled from source). Both linkages therefore build
+# CinderX from the same source tree with LTO enabled.
 ###############################################################################
 install_cinderx() {
   if [ "$DO_INSTALL_CINDERX" -eq 0 ]; then
@@ -1303,34 +1312,42 @@ install_cinderx() {
     return
   fi
 
-  if [ "$CINDERX_SOURCE" = "1" ]; then
-    log "Building CinderX from source ($CINDERX_REPO@$CINDERX_TAG)"
-    if [ ! -d "$SRC_CINDERX/.git" ]; then
-      git clone --depth 1 --branch "$CINDERX_TAG" "$CINDERX_REPO" "$SRC_CINDERX" \
-        2>&1 | tee "$LOGDIR/cinderx_clone.log" || die "CinderX clone failed"
-    fi
-    "$VPY" -m pip install setuptools \
-      >"$LOGDIR/cinderx_setuptools.log" 2>&1 || die "setuptools install failed"
-    ( cd "$SRC_CINDERX" \
-      && "$VPY" -m pip install -e . --no-build-isolation --reinstall \
-           >"$LOGDIR/cinderx_build.log" 2>&1 ) \
-      || die "CinderX source build failed (see $LOGDIR/cinderx_build.log)"
-  else
-    local spec="cinderx"
-    [ -n "$CINDERX_VERSION" ] && spec="cinderx==$CINDERX_VERSION"
-    log "Installing CinderX from PyPI ($spec)"
-    "$VPY" -m pip install "$spec" \
-      >"$LOGDIR/cinderx_pip.log" 2>&1 \
-      || die "CinderX PyPI install failed (see $LOGDIR/cinderx_pip.log). \
-Try --cinderx-source to build from git, or check your CPython is 3.14 with a compatible wheel."
-  fi
+  # Always build the dynamic CinderX from SOURCE — never a pre-built PyPI wheel.
+  # The wheel lacks our LTO + -fno-semantic-interposition changes, so it can't be
+  # used to test those optimizations on the dynamic build. Building from source
+  # here (into _cinderx.so) mirrors the static build, which also compiles CinderX
+  # from $SRC_CINDERX, giving a controlled, reproducible A/B between the two
+  # linkages. ensure_cinderx_source() (called before us in main) guarantees the
+  # checkout exists; --cinderx-repo/--cinderx-tag choose what it points at.
+  [ -f "$SRC_CINDERX/setup.py" ] \
+    || die "CinderX source not found at $SRC_CINDERX (expected setup.py). ensure_cinderx_source must run first (check the CinderX clone / --cinderx-repo / --cinderx-tag)."
+
+  # Match the toolchain used for CPython + the static CinderX archives so the
+  # dynamic _cinderx.so links against a compatible libstdc++/ABI. detect_toolchain
+  # is idempotent and populates TOOLCHAIN_CC/TOOLCHAIN_CXX.
+  detect_toolchain
+
+  # CINDERX_ENABLE_LTO=1 -> setup.py adds -DENABLE_LTO=ON to its cmake args,
+  # matching the static build's -DENABLE_LTO=ON. CC/CXX pin the same compiler
+  # detect_toolchain() selected (setup.py honours both when set).
+  local build_env=(CINDERX_ENABLE_LTO=1)
+  [ -n "$TOOLCHAIN_CC" ]  && build_env+=("CC=$TOOLCHAIN_CC")
+  [ -n "$TOOLCHAIN_CXX" ] && build_env+=("CXX=$TOOLCHAIN_CXX")
+
+  log "Building dynamic CinderX from source ($SRC_CINDERX) with LTO into the plain venv"
+  "$VPY" -m pip install setuptools \
+    >"$LOGDIR/cinderx_setuptools.log" 2>&1 || die "setuptools install failed"
+  ( cd "$SRC_CINDERX" \
+    && env "${build_env[@]}" "$VPY" -m pip install -e . --no-build-isolation --reinstall \
+         >"$LOGDIR/cinderx_build.log" 2>&1 ) \
+    || die "CinderX source build failed (see $LOGDIR/cinderx_build.log)"
 
   # Verify both ON and OFF states work.
   "$VPY" -c 'import cinderx.jit as j; print("cinderx import OK")' \
     >>"$LOGDIR/cinderx_verify.log" 2>&1 || die "cinderx import failed after install"
   local ver
   ver="$("$VPY" -m pip show cinderx 2>/dev/null | awk '/^Version:/{print $2}')"
-  ok "CinderX installed (version ${ver:-unknown})"
+  ok "CinderX built from source and installed into the plain venv (version ${ver:-unknown})"
 }
 
 # Ensure a CinderX *source* checkout exists at $SRC_CINDERX. The static build and
@@ -1388,9 +1405,9 @@ gen_jitlists() {
   # venv can produce them and the result is shared by all eight configs. Prefer
   # the plain venv (matches the dynamic configs); fall back to the static venv,
   # whose builtin _cinderx is always present. Without this, a plain venv that
-  # lacks the dynamic CinderX wheel (e.g. a run with --skip-cinderx, or no PyPI
-  # wheel for this CPython) makes gen_jitlist.py raise ModuleNotFoundError for
-  # EVERY benchmark and silently emit empty lists (the "funcs=0" symptom).
+  # lacks the source-built dynamic CinderX (e.g. a run with --skip-cinderx)
+  # makes gen_jitlist.py raise ModuleNotFoundError for EVERY benchmark and
+  # silently emit empty lists (the "funcs=0" symptom).
   local genpy="" genlabel=""
   if [ -n "$VPY" ] && "$VPY" -c 'import cinderx.jit' >/dev/null 2>&1; then
     genpy="$VPY"; genlabel="plain venv"
@@ -1398,9 +1415,9 @@ gen_jitlists() {
     genpy="$VPY_STATIC"; genlabel="static venv"
     warn "Plain venv cannot 'import cinderx'; generating JIT lists with the static venv instead."
     warn "The dynamic configs (dyn-nojit/dyn-auto/dyn-jitlist) will FAIL for the same reason —"
-    warn "install the dynamic CinderX into $VENV (re-run without --skip-cinderx; add --cinderx-source if there is no PyPI wheel for this CPython)."
+    warn "build the dynamic CinderX into $VENV (re-run without --skip-cinderx to compile it from source)."
   else
-    die "Neither venv can 'import cinderx.jit'; cannot generate JIT lists. Install CinderX first (dynamic wheel into the plain venv and/or the builtin in the static interpreter)."
+    die "Neither venv can 'import cinderx.jit'; cannot generate JIT lists. Build CinderX first (source build into the plain venv and/or the builtin in the static interpreter)."
   fi
   ok "Generating JIT lists with the $genlabel"
 
@@ -1672,14 +1689,14 @@ run_builtin() {
       # they `import cinderx.jit` (+ call cinderx.jit.auto()) unconditionally at
       # module scope. Decide how to satisfy that import for THIS config's
       # interpreter:
-      #   - real cinderx importable (static venv builtin, or plain venv with a
-      #     dynamic CinderX wheel) -> run as-is; the script's own auto() applies.
+      #   - real cinderx importable (static venv builtin, or plain venv with the
+      #     source-built dynamic CinderX) -> run as-is; the script's own auto() applies.
       #   - no real cinderx + "off" config -> put the no-op cinderx shim on
       #     PYTHONPATH so the bench runs as a genuine plain-CPython baseline
       #     (off == JIT disabled, which is exactly what the shim yields).
       #   - no real cinderx + non-off config -> a JIT config with no engine
       #     available; SKIP (don't fabricate plain-CPython numbers under a JIT
-      #     label). Requires the dynamic CinderX wheel in the plain venv.
+      #     label). Requires the source-built dynamic CinderX in the plain venv.
       local pypath_extra="" run_note=""
       if "$vpy" -c 'import cinderx.jit' >/dev/null 2>&1; then
         : # real cinderx available; nothing extra needed
@@ -1690,7 +1707,7 @@ run_builtin() {
         for t in $(seq 1 "$TRIALS"); do
           printf '%s\t%s\t%s\tSKIP\t\n' "$name" "$cname" "$t" >> "$tsv"
         done
-        warn "$name/$cname SKIPPED: interpreter cannot import cinderx and config needs the JIT (install the dynamic CinderX wheel into the plain venv)"
+        warn "$name/$cname SKIPPED: interpreter cannot import cinderx and config needs the JIT (build the dynamic CinderX from source into the plain venv)"
         continue
       fi
 
@@ -2128,7 +2145,7 @@ write_summary() {
     echo
     echo "- **Plain CPython:** $py_ver (PGO+LTO build at \`$PY_PREFIX\`)"
     echo "- **Static CPython:** $py_ver_static (builtin _cinderx at \`$PY_PREFIX_STATIC\`)"
-    echo "- **Dynamic CinderX:** ${dyn_ver:-unknown} (wheel in \`$VENV\`)"
+    echo "- **Dynamic CinderX:** ${dyn_ver:-unknown} (built from source into \`$VENV\`)"
     echo "- **Static CinderX:** ${static_ver:-unknown} (builtin _cinderx + PythonLib in \`$VENV_STATIC\`)"
     echo "- **Affinity:** ${AFFINITY:-none}   **Trials:** $TRIALS   **pyperf mode:** ${PYPERF_MODE:-steady-state}"
     if [ "$DO_BOLT" -eq 1 ]; then
@@ -2192,7 +2209,7 @@ main() {
   # The static venv needs the CinderX source for its PythonLib .pth; the suites
   # also run benchmark scripts from the source tree (not shipped in the wheel).
   ensure_cinderx_source
-  install_cinderx            # dynamic wheel into the plain venv (configs 2-4)
+  install_cinderx            # source-built dynamic CinderX into the plain venv (configs 2-4)
   install_cinderx_pythonlib  # PythonLib .pth into the static venv (configs 6-8)
   gen_jitlists               # generated once with the plain venv; shared by both
   bolt_optimize              # (opt-in --bolt) BOLT-optimize both interpreters in place
