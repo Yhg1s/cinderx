@@ -57,9 +57,7 @@ set -u -o pipefail
 CPYTHON_REPO="${CPYTHON_REPO:-https://github.com/python/cpython.git}"
 CPYTHON_TAG="${CPYTHON_TAG:-v3.14.5}"          # branch or tag to build
 CINDERX_REPO="${CINDERX_REPO:-https://github.com/facebookincubator/cinderx.git}"
-CINDERX_TAG="${CINDERX_TAG:-main}"             # only used with --cinderx-source
-CINDERX_VERSION="${CINDERX_VERSION:-}"         # deprecated/ignored: CinderX is always built from source (no PyPI wheel)
-CINDERX_SOURCE="${CINDERX_SOURCE:-1}"          # retained for compat; the dynamic/plain venv now ALWAYS builds CinderX from source
+CINDERX_TAG="${CINDERX_TAG:-main}"             # CinderX git tag/branch to build (CinderX is always built from source)
 CINDERX_CC="${CINDERX_CC:-}"                    # override C compiler for CPython + CinderX (default: auto-detect); CLI: --cc
 CINDERX_CXX="${CINDERX_CXX:-}"                  # override C++ compiler for CPython + CinderX (default: auto-detect); CLI: --cxx
 # Where each compiler override came from, for validation error messages. Seeded
@@ -76,6 +74,12 @@ PYPERF_MODE="${PYPERF_MODE:---fast}"           # --fast or "" (empty = full stea
 REGEN_JITLISTS="${REGEN_JITLISTS:-0}"          # 1 = regenerate JIT lists even if cached
 JIT_THRESHOLD="${JIT_THRESHOLD:-2}"            # gen_jitlist hot-function threshold (2=canonical)
 JIT_BUDGET="${JIT_BUDGET:-3.0}"               # gen_jitlist workload budget seconds
+
+# Free-threaded (PEP 703, no-GIL) build. When 1, CPython is configured with
+# --disable-gil and the CinderX cmake build gets free_threading=1. A free-threaded
+# build is a distinct ABI, so its WORKDIR-derived paths get a "-freethreading"
+# suffix (see below) to keep it isolated from a GIL-enabled build in the same root.
+FREE_THREADING="${FREE_THREADING:-0}"          # 1 = build free-threaded CPython (--disable-gil); CLI: --free-threading
 
 # Which phases to run (all on by default). Disabled via --skip-* flags.
 DO_BUILD_CPYTHON=1
@@ -94,17 +98,21 @@ PYPERF_BENCHES="${PYPERF_BENCHES:-richards,richards_super,spectral_norm,chaos,de
 # fastmark work-scale factor (lower = faster; 100 is fastmark's default).
 FASTMARK_SCALE="${FASTMARK_SCALE:-100}"
 
-# BOLT post-link optimization (opt-in via --bolt). BOLT rewrites each interpreter
-# binary's code layout from profile data (basic-block/function reordering, cold
-# splitting), directly targeting the ±10% binary-layout effect the foobar7/8
-# analysis measured between the plain and static builds. Off by default: it adds
-# build time and needs llvm-bolt (+ merge-fdata). When enabled, CPython is linked
-# with -Wl,--emit-relocs so BOLT can run in relocation mode (required for function
-# reordering); the static relink inherits that flag via configure's LDFLAGS.
+# BOLT post-link optimization (opt-in via --bolt) using CPython's own built-in
+# --enable-bolt support. BOLT rewrites the interpreter binary's code layout from
+# profile data (basic-block/function reordering, cold splitting), directly
+# targeting the ±10% binary-layout effect the foobar7/8 analysis measured between
+# the plain and static builds. Off by default: it adds build time and requires
+# llvm-bolt + merge-fdata on PATH. When enabled, build_cpython passes --enable-bolt
+# to ./configure, which rewires `make` into CPython's bolt-opt pipeline: build the
+# PGO+LTO python first, then instrument it with llvm-bolt, TRAIN with the full
+# CPython regression suite (PROFILE_TASK, instrumentation-based — no perf/LBR
+# needed), and apply the merged profile. configure also auto-injects the required
+# link/compile flags (-Wl,--emit-relocs, -fno-pie/-no-pie, and
+# -fno-reorder-blocks-and-partition) and skips the eval loop (-skip-funcs) so the
+# computed-goto interpreter core is not miscompiled. See build_cpython() and the
+# static-build re-BOLT step for the flow.
 DO_BOLT="${DO_BOLT:-0}"
-# Representative pyperformance benchmarks used to collect the BOLT profile — short
-# but they exercise the interpreter-core hot paths. Override with --bolt-benches.
-BOLT_BENCHES="${BOLT_BENCHES:-richards,raytrace,deltablue}"
 
 # ---------------------------------------------------------------------------
 # Derived paths.
@@ -195,10 +203,6 @@ SOURCES / VERSIONS:
   --cinderx-repo URL     CinderX git remote (used for BOTH the static and dynamic
                         source builds).                       (default: github.com/facebookincubator/cinderx)
   --cinderx-tag TAG      CinderX git tag/branch to build.     (default: main)
-  --cinderx-source       Accepted for backward compatibility, now a no-op: the
-                        dynamic CinderX is ALWAYS built from source.
-  --cinderx-version VER  Deprecated / ignored: CinderX is no longer installed from
-                        a PyPI wheel, so there is no version to pin.
 
 COMPILER / TOOLCHAIN:
   --cc PATH              C compiler for CPython + CinderX (full path or command
@@ -222,28 +226,45 @@ RUN TUNING:
   --jit-threshold N      gen_jitlist hot threshold            (default: 2)
   --jit-budget SECS      gen_jitlist workload budget          (default: 3.0)
 
+FREE-THREADING (PEP 703 / no-GIL) BUILD (optional):
+  --free-threading       Build the free-threaded (no-GIL) CPython: CPython is
+                        configured with --disable-gil and the CinderX archives are
+                        built with free_threading=1 (matching the interpreter's ABI).
+                        OFF by default (a normal GIL-enabled build). A free-threaded
+                        build is a distinct interpreter/ABI, so ALL work paths under
+                        --workdir get a "-freethreading" suffix (sources, installs,
+                        venvs, results) — a free-threaded run is fully isolated from
+                        a GIL-enabled run in the same --workdir and never reuses its
+                        cached builds. Also settable via FREE_THREADING=1.
+  --disable-gil          Alias for --free-threading.
+
 BOLT POST-LINK OPTIMIZATION (optional):
-  --bolt                 After building each interpreter, run LLVM BOLT to rewrite
-                        its code layout from a profile (basic-block + function
-                        reordering, cold-code splitting). This directly targets the
-                        ±10% binary-layout effect measured between the plain and
-                        static builds. OFF by default (adds build time; needs
-                        llvm-bolt + merge-fdata on PATH). When enabled, CPython is
-                        linked with -Wl,--emit-relocs so BOLT can reorder functions
-                        (relocation mode); the static relink inherits that flag. If
-                        llvm-bolt is absent, or a reused binary lacks relocations,
-                        BOLT is skipped with a warning (the build still completes).
+  --bolt                 Build CPython with its own --enable-bolt support so `make`
+                        runs the built-in bolt-opt pipeline: after the PGO+LTO build,
+                        llvm-bolt instruments the interpreter, TRAINS it with the full
+                        CPython regression suite (instrumentation-based — no perf or
+                        LBR needed), and applies the merged profile (basic-block +
+                        function reordering, cold-code splitting, and -skip-funcs for
+                        the eval loop). This directly targets the ±10% binary-layout
+                        effect measured between the plain and static builds. OFF by
+                        default (adds build time; requires llvm-bolt + merge-fdata on
+                        PATH — ./configure --enable-bolt HARD-FAILS if either is
+                        missing). configure auto-adds the needed flags
+                        (-Wl,--emit-relocs, -fno-pie/-no-pie,
+                        -fno-reorder-blocks-and-partition). The plain interpreter is
+                        BOLTed by `make`; the static interpreter is re-BOLTed after
+                        its `make python` relink via CPython's profile-bolt-stamp
+                        target (best-effort — the static build still completes if the
+                        re-BOLT fails).
   --no-bolt              Explicitly disable BOLT (the default).
-  --bolt-benches LIST    Comma-separated pyperformance benchmarks used to collect
-                        the BOLT profile (default: richards,raytrace,deltablue).
 
   -h, --help             Show this help and exit.
 
 ENVIRONMENT VARIABLES:
-  Every option above has a matching env var (CPYTHON_TAG, CINDERX_VERSION,
+  Every option above has a matching env var (CPYTHON_TAG, CINDERX_TAG,
   WORKDIR, JOBS, AFFINITY, TRIALS, PYPERF_MODE, PYPERF_BENCHES, FASTMARK_SCALE,
-  JIT_THRESHOLD, JIT_BUDGET, DO_BOLT, BOLT_BENCHES, ...). CLI flags take
-  precedence over env vars.
+  JIT_THRESHOLD, JIT_BUDGET, FREE_THREADING, DO_BOLT, ...). CLI flags
+  take precedence over env vars.
   WORKDIR is required: set it via --workdir or the $WORKDIR env var (no default).
   CINDERX_CC / CINDERX_CXX override the auto-detected compiler used for BOTH
   CPython and the CinderX archives (the --cc / --cxx flags take precedence over
@@ -284,13 +305,11 @@ while [ $# -gt 0 ]; do
     --skip-pyperf)        RUN_PYPERF=0 ;;
     --only-bench)         DO_BUILD_CPYTHON=0; DO_INSTALL_CINDERX=0; DO_VENV=0 ;;
     --regen-jitlists)     REGEN_JITLISTS=1 ;;
+    --free-threading|--disable-gil) FREE_THREADING=1 ;;
     --bolt)               DO_BOLT=1 ;;
     --no-bolt)            DO_BOLT=0 ;;
-    --bolt-benches)       BOLT_BENCHES="$2"; shift ;;
-    --cinderx-source)     CINDERX_SOURCE=1 ;;
     --cpython-tag)        CPYTHON_TAG="$2"; shift ;;
     --cpython-repo)       CPYTHON_REPO="$2"; shift ;;
-    --cinderx-version)    CINDERX_VERSION="$2"; shift ;;
     --cinderx-repo)       CINDERX_REPO="$2"; shift ;;
     --cinderx-tag)        CINDERX_TAG="$2"; shift ;;
     --cc)                 CINDERX_CC="$2";  CC_ORIGIN="--cc";  shift ;;
@@ -318,17 +337,26 @@ if [ -z "$WORKDIR" ]; then
 fi
 
 # Re-derive paths in case --workdir changed them.
-SRC_CPYTHON="$WORKDIR/cpython"
-SRC_CINDERX="$WORKDIR/cinderx"
-PY_PREFIX="$WORKDIR/python-install"
-PY_PREFIX_STATIC="$WORKDIR/python-install-static"
-VENV="$WORKDIR/venv"
-VENV_STATIC="$WORKDIR/venv-static"
-RESULTS="$WORKDIR/results"
-JITLIST_DIR="$WORKDIR/jitlists/lists"
-HELPERS="$WORKDIR/helpers"
+#
+# A free-threaded (no-GIL) build is a distinct ABI/interpreter, so it gets its own
+# "-freethreading" suffix on every WORKDIR-derived path. This keeps a free-threaded
+# run fully isolated from a GIL-enabled run under the same --workdir: separate
+# source trees, installs, venvs, and results (no accidental reuse of the other
+# variant's cached build). Empty suffix => the default GIL build uses the plain
+# path names, so existing workdirs are unaffected.
+FT_SUFFIX=""
+[ "$FREE_THREADING" -eq 1 ] && FT_SUFFIX="-freethreading"
+SRC_CPYTHON="$WORKDIR/cpython$FT_SUFFIX"
+SRC_CINDERX="$WORKDIR/cinderx$FT_SUFFIX"
+PY_PREFIX="$WORKDIR/python-install$FT_SUFFIX"
+PY_PREFIX_STATIC="$WORKDIR/python-install-static$FT_SUFFIX"
+VENV="$WORKDIR/venv$FT_SUFFIX"
+VENV_STATIC="$WORKDIR/venv-static$FT_SUFFIX"
+RESULTS="$WORKDIR/results$FT_SUFFIX"
+JITLIST_DIR="$WORKDIR/jitlists$FT_SUFFIX/lists"
+HELPERS="$WORKDIR/helpers$FT_SUFFIX"
 LOGDIR="$RESULTS/logs"
-STATIC_BUILD_DIR="$WORKDIR/cinderx-static-build"
+STATIC_BUILD_DIR="$WORKDIR/cinderx-static-build$FT_SUFFIX"
 
 ###############################################################################
 # The eight benchmark configurations.
@@ -405,24 +433,20 @@ preflight() {
     warn "No suitable C++20 compiler (gcc 13+ or clang) found; required to build the static CPython"; missing=1
   fi
 
-  # BOLT (opt-in): check llvm-bolt availability. If it is missing we DISABLE BOLT
-  # here (rather than failing) so the rest of the pipeline still runs — and so
-  # build_cpython does NOT add -Wl,--emit-relocs (which would otherwise bloat the
-  # binary for a BOLT pass that can never happen). Preflight runs before the build,
-  # so this decision propagates correctly.
+  # BOLT (opt-in): with --bolt we build CPython using its built-in --enable-bolt
+  # support (see build_cpython). ./configure --enable-bolt HARD-FAILS if it cannot
+  # find llvm-bolt AND merge-fdata on PATH, so we just verify both exist here and
+  # fail early with a clear message rather than surfacing a confusing configure
+  # abort later. (The built-in pipeline is instrumentation-based, so perf/perf2bolt
+  # are NOT required.)
   if [ "$DO_BOLT" -eq 1 ]; then
-    if command -v llvm-bolt >/dev/null 2>&1; then
-      ok "BOLT enabled: llvm-bolt found ($(llvm-bolt --version 2>&1 | sed -n 's/.*LLVM version/LLVM/p;q'))"
-      if ! command -v merge-fdata >/dev/null 2>&1; then
-        warn "merge-fdata not found (ships with LLVM BOLT); multi-benchmark BOLT profiles cannot be merged — a single profile will be used instead."
-      fi
-      if ! command -v readelf >/dev/null 2>&1 && ! command -v llvm-readelf >/dev/null 2>&1; then
-        warn "readelf/llvm-readelf not found; cannot verify -Wl,--emit-relocs before BOLT (BOLT will be attempted regardless)."
-      fi
-    else
-      warn "llvm-bolt not found on PATH; --bolt requested but BOLT will be SKIPPED. Install LLVM BOLT (e.g. distro 'bolt'/'llvm' package) and re-run."
-      DO_BOLT=0
+    local _bmiss=0
+    command -v llvm-bolt   >/dev/null 2>&1 || { warn "--bolt requested but llvm-bolt not found on PATH"; _bmiss=1; }
+    command -v merge-fdata >/dev/null 2>&1 || { warn "--bolt requested but merge-fdata not found on PATH"; _bmiss=1; }
+    if [ "$_bmiss" -eq 1 ]; then
+      die "BOLT requires both llvm-bolt and merge-fdata on PATH (./configure --enable-bolt hard-fails without them). Install a modern LLVM BOLT toolchain (>=16) and re-run, or drop --bolt."
     fi
+    ok "BOLT enabled: llvm-bolt ($(llvm-bolt --version 2>&1 | sed -n 's/.*LLVM version/LLVM/p;q')) + merge-fdata found; CPython will build with --enable-bolt"
   fi
 
   [ "$missing" -eq 0 ] || die "Missing prerequisites above. Install them and re-run."
@@ -904,16 +928,27 @@ build_cpython() {
   local cc_args=()
   [ -n "$TOOLCHAIN_CC" ]  && cc_args+=("CC=$TOOLCHAIN_CC")
   [ -n "$TOOLCHAIN_CXX" ] && cc_args+=("CXX=$TOOLCHAIN_CXX")
-  # When BOLT is enabled, link with -Wl,--emit-relocs so llvm-bolt can run in
-  # relocation mode (required for function reordering / cold splitting). configure
-  # records LDFLAGS into the Makefile, so both the PGO `make` here AND the static
-  # `make python` relink (build_static_cpython) inherit the flag — the static
-  # binary therefore also carries relocations for its own BOLT pass. Any existing
-  # $LDFLAGS is preserved.
+  # When BOLT is enabled, use CPython's built-in --enable-bolt. This rewires the
+  # subsequent `make` into the bolt-opt pipeline (build the PGO+LTO python, then
+  # instrument it, TRAIN with the full regression suite, and apply the merged
+  # profile) and auto-injects every flag BOLT needs: -Wl,--emit-relocs (relocation
+  # mode / function reordering), -fno-pie -no-pie, and
+  # -fno-reorder-blocks-and-partition, plus -skip-funcs for the eval loop. configure
+  # records these in the Makefile, so the static `make python` relink
+  # (build_static_cpython) inherits the emit-relocs link flag too, letting the
+  # static binary be re-BOLTed there. configure HARD-FAILS if llvm-bolt/merge-fdata
+  # are missing (preflight already verified both exist).
   local extra_conf=()
   if [ "$DO_BOLT" -eq 1 ]; then
-    extra_conf+=("LDFLAGS=-Wl,--emit-relocs${LDFLAGS:+ $LDFLAGS}")
-    log "BOLT enabled: linking CPython with -Wl,--emit-relocs (BOLT relocation mode)"
+    extra_conf+=("--enable-bolt")
+    log "BOLT enabled: configuring CPython with --enable-bolt (make will run the built-in bolt-opt pipeline)"
+  fi
+  # Free-threaded (PEP 703) build: configure CPython with --disable-gil so the
+  # interpreter is built without the GIL. sysconfig then reports Py_GIL_DISABLED=1,
+  # which build_static_cpython() reads to build the CinderX archives to match.
+  if [ "$FREE_THREADING" -eq 1 ]; then
+    extra_conf+=("--disable-gil")
+    log "Free-threading enabled: configuring CPython with --disable-gil (no-GIL build)"
   fi
   if [ "${#cc_args[@]}" -gt 0 ]; then
     log "Configuring CPython with PGO + LTO and ${cc_args[*]}"
@@ -1079,6 +1114,17 @@ build_static_cpython() {
   pyver="$("$PY_PREFIX/bin/python3" -c 'import sys;print("%d.%d"%sys.version_info[:2])')" \
     || die "could not determine CPython version"
   ft="$("$PY_PREFIX/bin/python3" -c 'import sysconfig;print(1 if sysconfig.get_config_var("Py_GIL_DISABLED") else 0)')"
+  # --free-threading forces free_threading=1 for the CinderX archives even if the
+  # auto-detect above somehow disagrees (e.g. a reused/plain interpreter). When the
+  # plain CPython was built with --disable-gil the two already agree.
+  [ "$FREE_THREADING" -eq 1 ] && ft=1
+
+  # Free-threaded CPython installs its headers under include/python<ver>t (the 't'
+  # ABI-flag suffix), NOT include/python<ver>, so the wrapper compile's -I must
+  # carry the same suffix or it fails with "'Python.h' file not found". Derive the
+  # abiflags from $ft so both the GIL and free-threaded builds resolve correctly.
+  local pyabi=""
+  [ "$ft" -eq 1 ] && pyabi="t"
 
   # Build the CinderX static archives with cmake (option matrix mirrors CinderX's
   # setup.py for a stock 3.14+ non-meta interpreter; cinderx-lib transitively
@@ -1152,7 +1198,7 @@ PyMODINIT_FUNC PyInit__cinderx(void) {
 CPPEOF
   log "Compiling PyInit__cinderx wrapper ($TOOLCHAIN_CXX, out-of-band)"
   "$TOOLCHAIN_CXX" -std=c++20 -fPIC -O2 \
-      -I"$PY_PREFIX/include/python$pyver" \
+      -I"$PY_PREFIX/include/python$pyver$pyabi" \
       -c "$wrapper_cpp" -o "$wrapper_o" \
       >"$LOGDIR/static_wrapper_compile.log" 2>&1 \
     || die "wrapper compile failed (see $LOGDIR/static_wrapper_compile.log)"
@@ -1173,20 +1219,106 @@ CPPEOF
     printf ' -Wl,--end-group -lstdc++ -lz -lm\n'
   } > "$SRC_CPYTHON/Modules/Setup.local"
 
+  # --- Preserve PGO across the static relink -------------------------------
+  # The plain build gets its PGO from CPython's `profile-opt` target, whose final
+  # "use" phase passes the profile-use flag on the *make command line*
+  #   $(MAKE) build_all CFLAGS_NODIST="$(CFLAGS_NODIST) $(PGO_PROF_USE_FLAG)"
+  # The flag is NOT persisted in the generated Makefile. Editing Setup.local forces
+  # the relink to recompile the builtin extension modules (config, posixmodule,
+  # _io/*, _sre, _datetimemodule, itertoolsmodule, _collectionsmodule,
+  # _functoolsmodule, ... ~40 objects); the interpreter core (Python/ceval.o,
+  # Objects/*) is NOT recompiled, so it keeps its PGO. But those recompiled modules,
+  # built by a bare `make python`, lose -fprofile-*use — the exact regression this
+  # fixes (foobar13: 0 occurrences of fprofile in the relink; the plain build had it
+  # on every module compile).
+  #
+  # Re-apply the flag exactly as profile-opt does: append $(PGO_PROF_USE_FLAG) to
+  # CFLAGS_NODIST on the `make python` command line. We pass it as a literal make
+  # reference (single-quoted so bash does not touch it) so make resolves it to
+  # whatever the Makefile defines for THIS toolchain — clang:
+  #   -fprofile-instr-use="$(shell pwd)/code.profclangd"   (expands to this tree)
+  # gcc:
+  #   -fprofile-use -fprofile-correction                   (reads .gcda beside objects)
+  # The profile data (code.profclangd / *.gcda) is left in the build tree by the
+  # plain build's profile-opt run, so the flag resolves against real data.
+  #
+  # Guarded on profile-run-stamp (written only after a successful PGO training run)
+  # AND a non-empty PGO_PROF_USE_FLAG, so a reused non-optimized tree still relinks
+  # cleanly instead of failing on a missing profile.
+  local relink_args=() pgo_use_flag="" base_cflags_nodist=""
+  pgo_use_flag="$(sed -n 's/^PGO_PROF_USE_FLAG[[:space:]]*=[[:space:]]*//p' "$SRC_CPYTHON/Makefile" | head -1)"
+  if [ -f "$SRC_CPYTHON/profile-run-stamp" ] && [ -n "$pgo_use_flag" ]; then
+    # $(CFLAGS_NODIST) is empty in a stock CPython Makefile, but preserve any base
+    # value defensively, then append the profile-use flag (mirrors profile-opt).
+    base_cflags_nodist="$(sed -n 's/^CFLAGS_NODIST[[:space:]]*=[[:space:]]*//p' "$SRC_CPYTHON/Makefile" | head -1)"
+    relink_args+=("CFLAGS_NODIST=${base_cflags_nodist:+$base_cflags_nodist }"'$(PGO_PROF_USE_FLAG)')
+    log "PGO: static relink will recompile with profile-use flags (PGO_PROF_USE_FLAG=$pgo_use_flag)"
+  else
+    warn "PGO: no trained profile in $SRC_CPYTHON (profile-run-stamp / PGO_PROF_USE_FLAG missing); static relink will NOT be PGO-optimized"
+  fi
+
   # Relink. Use `make python` (NOT plain `make`, which would redo the full PGO
   # instrument+train pass). Editing Setup.local makes the Makefile regenerate
   # itself on the first invocation; run again so the new config.c/_cinderx links.
   log "Relinking CPython with the builtin _cinderx (make python -j$JOBS)"
-  ( cd "$SRC_CPYTHON" && make python -j"$JOBS" ) \
+  ( cd "$SRC_CPYTHON" && make python -j"$JOBS" "${relink_args[@]}" ) \
       >"$LOGDIR/static_make_python.log" 2>&1 || true
   if ! "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null; then
     log "  (re-running make python after Makefile regeneration)"
-    ( cd "$SRC_CPYTHON" && make python -j"$JOBS" ) \
+    ( cd "$SRC_CPYTHON" && make python -j"$JOBS" "${relink_args[@]}" ) \
         >>"$LOGDIR/static_make_python.log" 2>&1 || true
   fi
   "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null \
     || die "could not link builtin _cinderx (see $LOGDIR/static_make_python.log)"
   ok "Linked builtin _cinderx"
+
+  # Verify PGO parity: the relink log should now show the profile-use flag on the
+  # recompiled objects (the task's success criterion). Soft-checked — a warning,
+  # not a failure, so the pipeline still completes if make short-circuited with
+  # nothing to recompile.
+  if [ "${#relink_args[@]}" -gt 0 ]; then
+    if grep -q 'fprofile' "$LOGDIR/static_make_python.log" 2>/dev/null; then
+      ok "PGO: static relink recompiled objects with profile-use flags (PGO retained)"
+    else
+      warn "PGO: expected profile-use flags in the static relink but none found in $LOGDIR/static_make_python.log"
+    fi
+  fi
+
+  # --- Re-apply BOLT to the static interpreter (opt-in --bolt) --------------
+  # --enable-bolt only BOLTs the build-tree python during the plain `make`
+  # (bolt-opt). The static `make python` relink above produced a FRESH binary
+  # (new config.c + _cinderx.o); that discards the BOLT layout, because BOLT is a
+  # post-link rewrite and cannot survive a relink. Re-apply it here using CPython's
+  # OWN built-in profile-bolt-stamp target — the exact instrument -> train (full
+  # test suite) -> apply pipeline configure wired up — so the static binary reaches
+  # BOLT parity with the plain one, still without any manual llvm-bolt code.
+  #
+  # profile-bolt-stamp restores $(BUILDPYTHON).prebolt (if present) before
+  # instrumenting. That stale .prebolt is the PLAIN pre-BOLT binary from the initial
+  # build and would clobber our static relink, so we delete it (plus the stamp and
+  # any leftover .fdata) first — the target then treats the freshly relinked STATIC
+  # binary as pristine. Best-effort: on any failure we restore the pristine static
+  # relink (profile-bolt-stamp's own .prebolt backup) so the build never breaks.
+  if [ "$DO_BOLT" -eq 1 ]; then
+    log "BOLT: re-applying to the static interpreter via CPython's profile-bolt-stamp (train = full test suite; slow)"
+    rm -f "$SRC_CPYTHON/python.prebolt" "$SRC_CPYTHON/profile-bolt-stamp" \
+          "$SRC_CPYTHON"/python.*.fdata "$SRC_CPYTHON/python.fdata" 2>/dev/null
+    if ( cd "$SRC_CPYTHON" && make profile-bolt-stamp -j"$JOBS" ) >"$LOGDIR/static_bolt.log" 2>&1 \
+       && "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null; then
+      ok "BOLT[static]: static interpreter re-BOLTed (see $LOGDIR/static_bolt.log)"
+    else
+      warn "BOLT[static]: profile-bolt-stamp failed or produced an unusable binary (see $LOGDIR/static_bolt.log)"
+      if [ -f "$SRC_CPYTHON/python.prebolt" ]; then
+        warn "BOLT[static]: restoring the pristine static relink from python.prebolt"
+        cp -f "$SRC_CPYTHON/python.prebolt" "$SRC_CPYTHON/python" \
+          || die "BOLT[static]: failed to restore static python from backup"
+      fi
+      # Whatever remains must still be a working static interpreter.
+      "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null \
+        || die "BOLT[static]: static python is broken and could not be restored (see $LOGDIR/static_bolt.log)"
+      warn "BOLT[static]: continuing with the unbolted static interpreter"
+    fi
+  fi
 
   # Materialise the static interpreter in its OWN prefix: copy the entire plain
   # prefix (stdlib, headers, pip, ...) then swap in the freshly relinked binary.
@@ -1342,6 +1474,18 @@ install_cinderx() {
          >"$LOGDIR/cinderx_build.log" 2>&1 ) \
     || die "CinderX source build failed (see $LOGDIR/cinderx_build.log)"
 
+  # Confirm LTO actually reached the dynamic build. setup.py prints
+  # "Building with LTO enabled (full LTO)" whenever CINDERX_ENABLE_LTO is set, and
+  # the CinderX CMakeLists emits "LTO: Enabled" once -DENABLE_LTO=ON reaches cmake.
+  # foobar17 showed the dynamic _cinderx.so can be built WITHOUT LTO if the editable
+  # install doesn't inherit the env (the cibuildwheel LTO setting applies only to
+  # wheel builds), so surface that here instead of letting it pass silently.
+  if grep -Eq 'Building with LTO enabled|LTO: Enabled' "$LOGDIR/cinderx_build.log"; then
+    ok "Dynamic CinderX build configured with LTO (confirmed in cinderx_build.log)"
+  else
+    warn "Could not confirm LTO in the dynamic CinderX build log ($LOGDIR/cinderx_build.log); the _cinderx.so may have been built WITHOUT LTO"
+  fi
+
   # Verify both ON and OFF states work.
   "$VPY" -c 'import cinderx.jit as j; print("cinderx import OK")' \
     >>"$LOGDIR/cinderx_verify.log" 2>&1 || die "cinderx import failed after install"
@@ -1353,7 +1497,7 @@ install_cinderx() {
 # Ensure a CinderX *source* checkout exists at $SRC_CINDERX. The static build and
 # the static venv's PythonLib need it, and benchmark suites A/B/C run scripts from
 # the source tree's cinderx/benchmarks/ directory, which is NOT included in the
-# PyPI wheel. Idempotent (build_static_cpython / --cinderx-source may already have
+# PyPI wheel. Idempotent (build_static_cpython / install_cinderx may already have
 # cloned here; this just fills the gap otherwise).
 ensure_cinderx_source() {
   if [ -d "$SRC_CINDERX/.git" ] || [ -f "$SRC_CINDERX/CMakeLists.txt" ]; then
@@ -1421,242 +1565,116 @@ gen_jitlists() {
   fi
   ok "Generating JIT lists with the $genlabel"
 
-  local pp
-  pp="$("$genpy" -c 'import pyperformance,os;print(os.path.dirname(pyperformance.__file__))')" \
+  "$genpy" -c 'import pyperformance' 2>/dev/null \
     || die "pyperformance not importable in the $genlabel; cannot generate JIT lists"
-  local D="$pp/data-files/benchmarks"
   log "Generating JIT lists (threshold=$JIT_THRESHOLD, budget=${JIT_BUDGET}s) -> $JITLIST_DIR"
 
-  # Expand the benchmark selection. If it contains the special token "all"
-  # (optionally with negative excludes, e.g. "all,-telco,-unpack_sequence"),
-  # resolve it through pyperformance itself so we generate JIT lists for exactly
-  # the set pyperformance would run: "all" = every benchmark declared in the
-  # manifest, minus any -excludes, and filtered to those runnable on this
-  # interpreter. `pyperformance list -b <sel>` prints one "- <name>" per line.
-  # A plain list of benchmark names is used verbatim (no behaviour change).
-  local benches="$PYPERF_BENCHES"
+  # Resolve the benchmark selection ($PYPERF_BENCHES, which may be "all", a group
+  # name, or a list with negative excludes) to concrete benchmarks using
+  # pyperformance's OWN manifest/selection API, so we generate exactly the set
+  # pyperformance would run and — crucially — get each benchmark's real runscript
+  # and extra_opts.
+  #
+  # This is what fixes the METADATA mismatch: a single bm_<group>/run_benchmark.py
+  # can define MANY benchmark names, each selected by different extra_opts (e.g.
+  # bm_pickle -> pickle / pickle_dict / pickle_list / unpickle / ...; bm_async_tree
+  # -> async_tree_io / async_tree_memoization / ...; bm_argparse ->
+  # argparse_subparsers). The old code built the path bm_<name>/run_benchmark.py,
+  # which does NOT exist for those variant names, so it silently produced no list
+  # for any of them; it also never passed extra_opts, so even the base variant's
+  # run_benchmark.py aborted on its required positional argument.
+  #
+  # Emits one TAB-separated "name<TAB>group<TAB>runscript<TAB>opt opt ..." row per
+  # benchmark, where group is the bm_<group> directory basename (minus the bm_
+  # prefix) — the SAME key the consumer (sitecustomize._detect_benchmark) derives
+  # from the worker's run_benchmark.py path, so the list files we write are found.
+  local resolved
+  resolved="$("$genpy" - "$PYPERF_BENCHES" 2>"$LOGDIR/gjl_resolve.err" <<'PYEOF'
+import os, sys
+from pyperformance import _manifest
+from pyperformance.cli import _select_benchmarks
+
+sel = sys.argv[1]
+manifest = _manifest.load_manifest(None)
+for bench in _select_benchmarks(sel, manifest):
+    runscript = bench.runscript
+    if not runscript or not os.path.isfile(runscript):
+        continue
+    group = os.path.basename(os.path.dirname(runscript))
+    if group.startswith("bm_"):
+        group = group[3:]
+    print("\t".join([bench.name, group, runscript, " ".join(bench.extra_opts or ())]))
+PYEOF
+)"
+  [ -n "$resolved" ] || die "could not resolve benchmark selection '$PYPERF_BENCHES' via pyperformance (see $LOGDIR/gjl_resolve.err)"
+
   if printf '%s' ",$PYPERF_BENCHES," | grep -qiE ',[[:space:]]*all[[:space:]]*,'; then
-    log "Benchmark list contains 'all'; expanding via pyperformance list -b '$PYPERF_BENCHES'"
-    benches="$("$genpy" -m pyperformance list -b "$PYPERF_BENCHES" 2>/dev/null \
-                 | sed -n 's/^- //p' | tr '\n' ',')"
-    benches="${benches%,}"
-    [ -n "$benches" ] || die "could not expand 'all' via 'pyperformance list -b $PYPERF_BENCHES' (is pyperformance installed in the $genlabel?)"
-    ok "Expanded 'all' to $(printf '%s' "$benches" | tr ',' '\n' | grep -c .) benchmarks"
+    ok "Expanded '$PYPERF_BENCHES' to $(printf '%s\n' "$resolved" | grep -c .) benchmark(s)"
   fi
+
+  # Group the resolved benchmarks by their bm_<group> directory. Benchmarks that
+  # share one run_benchmark.py (the METADATA variants) collapse to a single group,
+  # and we UNION the hot functions captured across all of that group's variants
+  # into one <group>.jitlist. The consumer keys the list off the directory name
+  # only (it cannot tell which variant is running), so a per-group union is both
+  # the correct file name AND a superset that serves every variant of the group.
+  local groups
+  groups="$(printf '%s\n' "$resolved" | cut -f2 | awk 'NF && !seen[$0]++')"
 
   # Track outcomes so a systemic failure (e.g. cinderx not importable) is loud
   # instead of silently leaving a directory full of empty lists.
-  local made=0 failed=0
-  local IFS=','
-  for b in $benches; do
-    local bm="$D/bm_$b/run_benchmark.py"
-    if [ ! -f "$bm" ]; then warn "no pyperformance benchmark bm_$b; skipping list"; continue; fi
-    local jl="$JITLIST_DIR/$b.jitlist"
-    local rc=0
-    JIT_THRESHOLD="$JIT_THRESHOLD" "$genpy" "$HELPERS/gen_jitlist.py" "$bm" \
-        --budget "$JIT_BUDGET" >"$LOGDIR/gjl_$b.out" 2>"$LOGDIR/gjl_$b.err" || rc=$?
-    # Count only real entries (non-comment, non-blank). grep -c already prints 0
-    # and exits 1 on no match, so the earlier "|| echo 0" doubled the count.
+  local made=0 failed=0 nvariants=0
+  local g
+  while IFS= read -r g; do
+    [ -n "$g" ] || continue
+    local jl="$JITLIST_DIR/$g.jitlist"
+    local raw="$LOGDIR/gjl_${g}.raw"; : > "$raw"
+    local group_rc=0 variant_names=""
+    # Run every benchmark NAME that shares this bm_<group>/run_benchmark.py, each
+    # with its own extra_opts, and accumulate the hot functions it compiled.
+    local name group2 runscript opts
+    while IFS=$'\t' read -r name group2 runscript opts; do
+      [ "$group2" = "$g" ] || continue
+      variant_names="$variant_names $name"
+      nvariants=$((nvariants + 1))
+      local rc=0
+      # $opts is an intentionally-unquoted token list (pyperformance extra_opts,
+      # e.g. "pickle_dict", "io", or "--pure-python pickle"). gen_jitlist.py
+      # forwards them to run_benchmark.py's argument parser.
+      # shellcheck disable=SC2086
+      JIT_THRESHOLD="$JIT_THRESHOLD" "$genpy" "$HELPERS/gen_jitlist.py" "$runscript" \
+          --budget "$JIT_BUDGET" $opts \
+          >"$LOGDIR/gjl_$name.out" 2>"$LOGDIR/gjl_$name.err" || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        warn "$(printf '%-24s FAILED (rc=%s; see %s)' "$name" "$rc" "$LOGDIR/gjl_$name.err")"
+        group_rc=1
+      fi
+      # Collect real entries (non-comment, non-blank) for the union.
+      grep -vE '^[[:space:]]*(#|$)' "$LOGDIR/gjl_$name.out" 2>/dev/null >> "$raw" || true
+    done <<< "$resolved"
+
     local n
-    n="$(grep -vcE '^[[:space:]]*(#|$)' "$LOGDIR/gjl_$b.out" 2>/dev/null)"; n="${n:-0}"
     {
-      echo "# CinderX JIT list for pyperformance bm_$b"
+      echo "# CinderX JIT list for pyperformance bm_$g"
+      echo "# variants (union of hot functions):${variant_names}"
       echo "# gen_jitlist.py threshold=$JIT_THRESHOLD budget=${JIT_BUDGET}s (via $genlabel)"
-      echo "# $(tail -1 "$LOGDIR/gjl_$b.err" 2>/dev/null)"
       echo "# Format: module:qualname (one hot function per line)"
-      cat "$LOGDIR/gjl_$b.out"
+      sort -u "$raw"
     } > "$jl"
-    if [ "$rc" -ne 0 ]; then
-      warn "$(printf '%-16s FAILED (rc=%s; see %s)' "$b" "$rc" "$LOGDIR/gjl_$b.err")"
+    n="$(grep -vcE '^[[:space:]]*(#|$)' "$jl" 2>/dev/null)"; n="${n:-0}"
+    if [ "$group_rc" -ne 0 ]; then
       failed=$((failed + 1))
     else
-      printf '    %-16s funcs=%s\n' "$b" "$n"
+      printf '    %-24s funcs=%-5s variants:%s\n' "$g" "$n" "$variant_names"
       made=$((made + 1))
     fi
-  done
+  done <<< "$groups"
 
   if [ "$made" -eq 0 ]; then
     die "JIT-list generation produced no usable lists ($failed failed); see $LOGDIR/gjl_*.err"
   fi
-  [ "$failed" -eq 0 ] || warn "$failed JIT list(s) failed to generate; see $LOGDIR/gjl_*.err"
-  ok "JIT lists generated in $JITLIST_DIR ($made ok, $failed failed)"
-}
-
-###############################################################################
-# Phase 4b: BOLT post-link optimization of the interpreter binaries (opt-in).
-#
-# BOLT (LLVM Binary Optimization and Layout Tool) rewrites an already-linked
-# binary using profile data: it reorders basic blocks (ext-tsp), reorders whole
-# functions (cdsort) and splits cold code out of the hot path — exactly the code
-# placement that the foobar7/8 analysis showed accounts for ±10% of the
-# plain-vs-static gap. We optimize BOTH interpreters in place; because the venvs
-# reference the install-prefix python via symlink, swapping the binary makes every
-# subsequent benchmark run use the BOLT-optimized interpreter automatically.
-#
-# Profiling method: INSTRUMENTATION (llvm-bolt -instrument), not perf/perf2bolt.
-# Rationale: (1) it needs no perf_event_paranoid relaxation or root; (2) the
-# function-reordering/splitting we want requires BOLT's relocation mode either
-# way, which we already provide via -Wl,--emit-relocs at link time (see
-# build_cpython) — so perf2bolt would offer no advantage here. Each binary gets
-# its OWN profile (their hot paths differ). We profile with CINDERX_DISABLE=1 so
-# both binaries get a clean, comparable interpreter-core profile: JIT-compiled
-# code is generated at runtime and lives outside the ELF, so BOLT cannot touch it
-# regardless — the win is in the interpreter/runtime C code layout.
-###############################################################################
-
-# readelf shim: prefer binutils readelf, fall back to llvm-readelf. Returns 127
-# if neither exists (callers treat that as "cannot verify").
-bolt_readelf() {
-  if command -v readelf >/dev/null 2>&1; then readelf "$@"
-  elif command -v llvm-readelf >/dev/null 2>&1; then llvm-readelf "$@"
-  else return 127; fi
-}
-
-# BOLT-optimize one interpreter binary IN PLACE.
-#   $1 = install prefix (…/python-install or …/python-install-static)
-#   $2 = a venv python that has pyperformance installed (for the profile workload)
-#   $3 = label ("plain" / "static")
-# Best-effort: any failure leaves the ORIGINAL binary untouched (a .prebolt backup
-# is kept once we start swapping) and returns without aborting the pipeline.
-bolt_one() {
-  local prefix="$1" venv="$2" label="$3"
-  local py="$prefix/bin/python3"
-  [ -x "$py" ] || { warn "BOLT[$label]: no interpreter at $prefix; skipping"; return 0; }
-
-  local pyver bin
-  pyver="$("$py" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null)" \
-    || { warn "BOLT[$label]: could not determine python version; skipping"; return 0; }
-  bin="$(readlink -f "$prefix/bin/python$pyver" 2>/dev/null)"
-  [ -n "$bin" ] && [ -f "$bin" ] || { warn "BOLT[$label]: real binary python$pyver not found; skipping"; return 0; }
-
-  # Idempotent: a marker next to the binary records a completed BOLT pass.
-  if [ -f "$bin.bolt-done" ]; then
-    ok "BOLT[$label]: $bin already optimized; skipping"
-    return 0
-  fi
-
-  # Relocation mode (function reordering) needs -Wl,--emit-relocs -> a .rela.text
-  # section survives in the binary. Verify when we can; if the binary was reused
-  # from a non-BOLT build it will be missing and we skip gracefully.
-  if bolt_readelf -S "$bin" >/dev/null 2>&1; then
-    if ! bolt_readelf -S "$bin" 2>/dev/null | grep -qE '\.rela?\.text'; then
-      warn "BOLT[$label]: $bin has no .rela.text (linked without -Wl,--emit-relocs)."
-      warn "  It was likely built without --bolt. Remove $prefix and re-run with --bolt to rebuild with relocations; BOLT skipped for now."
-      return 0
-    fi
-  else
-    warn "BOLT[$label]: cannot verify relocations (no readelf); attempting BOLT anyway."
-  fi
-
-  # Locate the pyperformance benchmark scripts + this venv's site-packages so the
-  # (standalone) instrumented binary can import pyperf and the benchmark modules.
-  local pp bench_d sp
-  pp="$("$venv" -c 'import pyperformance,os;print(os.path.dirname(pyperformance.__file__))' 2>/dev/null)" \
-    || { warn "BOLT[$label]: pyperformance not importable in $venv; cannot build a profile — skipping"; return 0; }
-  bench_d="$pp/data-files/benchmarks"
-  sp="$("$venv" -c 'import site;print(site.getsitepackages()[0])' 2>/dev/null)" \
-    || { warn "BOLT[$label]: could not resolve site-packages for $venv; skipping"; return 0; }
-
-  local prof="$WORKDIR/bolt/$label"
-  rm -rf "$prof"; mkdir -p "$prof"
-  local inst="$bin.inst"
-  local TSPRE; TSPRE="$(taskset_prefix)"
-
-  # 1) Instrument. --instrumentation-file-append-pid gives one .fdata per process
-  #    so multiple benchmark runs accumulate instead of overwriting.
-  log "BOLT[$label]: instrumenting $bin"
-  if ! llvm-bolt "$bin" -instrument \
-        --instrumentation-file="$prof/prof.fdata" \
-        --instrumentation-file-append-pid \
-        -o "$inst" >"$LOGDIR/bolt_${label}_instrument.log" 2>&1; then
-    warn "BOLT[$label]: instrumentation failed (see $LOGDIR/bolt_${label}_instrument.log); original binary kept"
-    rm -f "$inst"
-    return 0
-  fi
-
-  # 2) Run the representative workload with the instrumented binary. CINDERX_DISABLE=1
-  #    keeps the profile to the interpreter core; PYTHONPATH exposes pyperf.
-  local ran=0 b
-  local OLDIFS="$IFS"; IFS=','
-  for b in $BOLT_BENCHES; do
-    IFS="$OLDIFS"
-    local bm="$bench_d/bm_$b/run_benchmark.py"
-    if [ ! -f "$bm" ]; then warn "BOLT[$label]: no pyperformance bm_$b for profiling; skipping it"; IFS=','; continue; fi
-    log "BOLT[$label]: profiling with bm_$b"
-    if env CINDERX_DISABLE=1 PYTHONPATH="$sp" $TSPRE "$inst" "$bm" --worker -l 1 -w 0 -n 1 \
-         >"$LOGDIR/bolt_${label}_run_$b.log" 2>&1; then
-      ran=$((ran + 1))
-    else
-      warn "BOLT[$label]: profiling run bm_$b failed (see $LOGDIR/bolt_${label}_run_$b.log)"
-    fi
-    IFS=','
-  done
-  IFS="$OLDIFS"
-
-  if [ "$ran" -eq 0 ]; then
-    warn "BOLT[$label]: no profiling workload ran; BOLT skipped, original binary kept"
-    rm -f "$inst"
-    return 0
-  fi
-
-  # 3) Merge the per-process profiles into one fdata (merge-fdata ships with BOLT).
-  local fdata=( "$prof"/prof.fdata* )
-  if [ ! -e "${fdata[0]}" ]; then
-    warn "BOLT[$label]: instrumented run produced no .fdata; BOLT skipped, original kept"
-    rm -f "$inst"
-    return 0
-  fi
-  local merged="$prof/merged.fdata"
-  if command -v merge-fdata >/dev/null 2>&1; then
-    if ! merge-fdata "${fdata[@]}" > "$merged" 2>"$LOGDIR/bolt_${label}_merge.log"; then
-      warn "BOLT[$label]: merge-fdata failed (see $LOGDIR/bolt_${label}_merge.log); BOLT skipped, original kept"
-      rm -f "$inst"
-      return 0
-    fi
-  elif [ "${#fdata[@]}" -eq 1 ]; then
-    merged="${fdata[0]}"
-  else
-    warn "BOLT[$label]: merge-fdata unavailable and ${#fdata[@]} profiles present; using only the first"
-    merged="${fdata[0]}"
-  fi
-
-  # 4) Optimize using the profile.
-  local opt="$bin.bolt"
-  log "BOLT[$label]: optimizing (reorder-blocks=ext-tsp, reorder-functions=cdsort, split-functions, split-all-cold)"
-  if ! llvm-bolt "$bin" -o "$opt" -data="$merged" \
-        -reorder-blocks=ext-tsp -reorder-functions=cdsort \
-        -split-functions -split-all-cold -dyno-stats \
-        >"$LOGDIR/bolt_${label}_optimize.log" 2>&1; then
-    warn "BOLT[$label]: optimization failed (see $LOGDIR/bolt_${label}_optimize.log); original binary kept"
-    rm -f "$inst" "$opt"
-    return 0
-  fi
-
-  # 5) Swap in the optimized binary (backup the original first) and smoke-test it.
-  cp -f "$bin" "$bin.prebolt" || { warn "BOLT[$label]: could not back up original; keeping original, skipping swap"; rm -f "$inst" "$opt"; return 0; }
-  if ! cp -f "$opt" "$bin"; then
-    warn "BOLT[$label]: could not install optimized binary; restoring original"
-    cp -f "$bin.prebolt" "$bin"
-    rm -f "$inst" "$opt"
-    return 0
-  fi
-  if ! "$py" -c 'import sys; sys.exit(0)' >/dev/null 2>&1; then
-    warn "BOLT[$label]: optimized binary fails to run; restoring original"
-    cp -f "$bin.prebolt" "$bin"
-    rm -f "$inst" "$opt" "$bin.bolt-done"
-    return 0
-  fi
-  : > "$bin.bolt-done"
-  rm -f "$inst"
-  ok "BOLT[$label]: $bin optimized (original backed up at $bin.prebolt; dyno-stats in $LOGDIR/bolt_${label}_optimize.log)"
-  return 0
-}
-
-bolt_optimize() {
-  [ "$DO_BOLT" -eq 1 ] || return 0
-  log "BOLT: post-link optimization of both interpreter binaries (benches=$BOLT_BENCHES)"
-  bolt_one "$PY_PREFIX"        "$VPY"        "plain"
-  bolt_one "$PY_PREFIX_STATIC" "$VPY_STATIC" "static"
+  [ "$failed" -eq 0 ] || warn "$failed JIT list group(s) failed to generate; see $LOGDIR/gjl_*.err"
+  ok "JIT lists generated in $JITLIST_DIR ($made group(s), $nvariants benchmark variant(s), $failed failed)"
 }
 
 ###############################################################################
@@ -2149,12 +2167,24 @@ write_summary() {
     echo "- **Static CinderX:** ${static_ver:-unknown} (builtin _cinderx + PythonLib in \`$VENV_STATIC\`)"
     echo "- **Affinity:** ${AFFINITY:-none}   **Trials:** $TRIALS   **pyperf mode:** ${PYPERF_MODE:-steady-state}"
     if [ "$DO_BOLT" -eq 1 ]; then
-      local bolt_plain="no" bolt_static="no"
-      [ -f "$(readlink -f "$PY_PREFIX/bin/python3" 2>/dev/null).bolt-done" ] 2>/dev/null && bolt_plain="yes"
-      [ -f "$(readlink -f "$PY_PREFIX_STATIC/bin/python3" 2>/dev/null).bolt-done" ] 2>/dev/null && bolt_static="yes"
-      echo "- **BOLT:** enabled (profile benches=\`$BOLT_BENCHES\`) — plain optimized: $bolt_plain, static optimized: $bolt_static"
+      # Report whether each interpreter actually carries a BOLTed layout. Built-in
+      # BOLT (make bolt-opt for plain; profile-bolt-stamp re-BOLT for static) adds
+      # .text.bolt / .bolt.org.text / .text.hot / .text.cold sections; detect them
+      # with readelf/llvm-readelf when available, else just report "enabled".
+      # Capture-then-match (here-string) avoids the pipefail+SIGPIPE false negative.
+      local bolt_plain="enabled" bolt_static="enabled" _re="" _pb _sb _secs
+      if command -v readelf >/dev/null 2>&1; then _re="readelf"
+      elif command -v llvm-readelf >/dev/null 2>&1; then _re="llvm-readelf"; fi
+      if [ -n "$_re" ]; then
+        bolt_plain="no"; bolt_static="no"
+        _pb="$(readlink -f "$PY_PREFIX/bin/python3" 2>/dev/null)"
+        _sb="$(readlink -f "$PY_PREFIX_STATIC/bin/python3" 2>/dev/null)"
+        if [ -n "$_pb" ]; then _secs="$("$_re" -S "$_pb" 2>/dev/null)"; grep -qE '\.(text\.bolt|bolt\.org\.text|text\.hot|text\.cold)' <<<"$_secs" && bolt_plain="yes"; fi
+        if [ -n "$_sb" ]; then _secs="$("$_re" -S "$_sb" 2>/dev/null)"; grep -qE '\.(text\.bolt|bolt\.org\.text|text\.hot|text\.cold)' <<<"$_secs" && bolt_static="yes"; fi
+      fi
+      echo "- **BOLT:** enabled via CPython \`--enable-bolt\` (built-in bolt-opt; train = full test suite) — plain BOLTed: $bolt_plain, static re-BOLTed: $bolt_static"
     else
-      echo "- **BOLT:** disabled (pass \`--bolt\` to enable post-link binary-layout optimization)"
+      echo "- **BOLT:** disabled (pass \`--bolt\` to build CPython with \`--enable-bolt\`)"
     fi
     echo "- **Generated:** $(date)"
     echo
@@ -2212,7 +2242,6 @@ main() {
   install_cinderx            # source-built dynamic CinderX into the plain venv (configs 2-4)
   install_cinderx_pythonlib  # PythonLib .pth into the static venv (configs 6-8)
   gen_jitlists               # generated once with the plain venv; shared by both
-  bolt_optimize              # (opt-in --bolt) BOLT-optimize both interpreters in place
   run_builtin
   run_fastmark
   run_static
