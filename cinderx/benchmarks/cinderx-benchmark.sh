@@ -12,23 +12,29 @@
 #   2. Build the CinderX static archives and relink CPython into a SECOND prefix
 #      (the "static" CPython, with _cinderx as a builtin module). Only one PGO
 #      build runs — the static binary is a `make python` relink of the same tree.
-#   3. Create TWO benchmark virtualenvs (one per interpreter) and install
-#      pyperformance + the fastmark benchmark dependencies in both. CinderX is
-#      built from source (with LTO) for BOTH interpreters — never a PyPI wheel:
-#         - plain venv:  CinderX built from source into a dynamic _cinderx.so
+#   3. Create THREE benchmark virtualenvs and install pyperformance + the fastmark
+#      benchmark dependencies in each. The dynamic and static linkages build
+#      CinderX from source (with LTO); the third is the pre-built PyPI wheel:
+#         - plain venv:  CinderX built from source into a dynamic _cinderx.so (LTO)
 #         - static venv: pure-Python cinderx package (PythonLib) via a .pth file
-#                        backed by the builtin _cinderx compiled in step 2
-#   4. Generate per-benchmark JIT lists once (shared by both interpreters).
-#   5. Run four benchmark suites, each across EIGHT configurations — the cross
-#      product of {plain, static} CPython and four JIT modes (off / no-jit /
+#                        backed by the builtin _cinderx compiled in step 2 (LTO)
+#         - pip venv:    SAME plain interpreter, but CinderX installed as the
+#                        pre-built PyPI wheel via `pip install cinderx` (LTO+PGO).
+#                        REQUIRED by default (a failed install aborts the run);
+#                        pass --skip-pip to omit it (e.g. offline).
+#   4. Generate per-benchmark JIT lists once (shared by all interpreters).
+#   5. Run four benchmark suites, each across TWELVE configurations — the cross
+#      product of {plain, static, pip} CinderX and four JIT modes (off / no-jit /
 #      auto / per-benchmark jit-list):
-#         1. plain-off       5. static-off
-#         2. dyn-nojit       6. static-nojit
-#         3. dyn-auto        7. static-auto
-#         4. dyn-jitlist     8. static-jitlist
+#         1. plain-off       5. static-off       9.  pip-off
+#         2. dyn-nojit       6. static-nojit     10. pip-nojit
+#         3. dyn-auto        7. static-auto      11. pip-auto
+#         4. dyn-jitlist     8. static-jitlist   12. pip-jitlist
+#      (With --skip-pip the pip column is dropped and it is an 8-way run.)
 #      The four suites are: A. CinderX built-in lightweight benchmarks,
 #      B. fastmark, C. Static-Python variants, D. pyperformance.
-#   6. Emit an 8-way comparison table / markdown report for every suite.
+#   6. Emit an N-way comparison table / markdown report for every suite. The pip
+#      configs (LTO+PGO) vs the source-built ones (LTO only) isolate the PGO effect.
 #
 # The eight configurations are driven entirely by environment variables that the
 # embedded sitecustomize.py interprets:
@@ -91,9 +97,51 @@ RUN_FASTMARK=1
 RUN_STATIC=1
 RUN_PYPERF=1
 
-# pyperformance benchmark set for suite D (5 prior winners + 5 prior regressions:
-# high-signal, fast enough for repeated runs). Override with --pyperf-benches.
-PYPERF_BENCHES="${PYPERF_BENCHES:-richards,richards_super,spectral_norm,chaos,deltablue,fannkuch,raytrace,generators,go,nqueens}"
+# Third "pip" venv: same plain interpreter, but CinderX installed as the pre-built
+# PyPI wheel (LTO+PGO) via `pip install cinderx`, giving a 3-way linkage compare
+# (pip-wheel LTO+PGO vs source-built LTO vs static-builtin LTO) in every run.
+# REQUIRED by default: if the wheel can't be installed the run FAILS. Pass
+# --skip-pip (DO_PIP=0) to omit this venv entirely (e.g. offline environments).
+DO_PIP="${DO_PIP:-1}"
+
+# ---------------------------------------------------------------------------
+# pyperformance benchmark PRESETS for suite D.
+#
+# --pyperf-benches accepts either a concrete pyperformance selection (a
+# comma-separated list of names/groups, "all", negative excludes, ...  — passed
+# straight through to pyperformance) OR one of the named presets below, which are
+# expanded to a fixed benchmark list before use (see resolve_pyperf_preset):
+#
+#   quick     10 high-signal benchmarks (5 prior JIT winners + 5 prior
+#             regressions): fast enough to iterate, historically the default.
+#   reliable  31-benchmark curated low-noise set from the pyperf noise analysis
+#             (median within-config CV < 3% across the 8-way BOLT/LTO run),
+#             spanning 11 workload types and mixing strong JIT winners with
+#             JIT-neutral controls. ~4x smaller than the full ~121-bench suite
+#             for meaningful signal at 3-5 trials. Alias: "curated".
+#   all       every pyperformance benchmark (handled by pyperformance itself).
+#
+# The "reliable" list comes from the noise analysis in
+# ~/tmp/cinderx-benchmarking-clang-bolt-lto-full-source-builds-2/results/
+# (CURATED_SET.md / NOISE_ANALYSIS.md).
+PYPERF_PRESET_QUICK="richards,richards_super,spectral_norm,chaos,deltablue,fannkuch,raytrace,generators,go,nqueens"
+PYPERF_PRESET_RELIABLE="ascii85_small,async_tree_eager,base32_small,base85_small,bench_thread_pool,chameleon,chaos,connected_components,coroutines,docutils,dulwich_log,float,generators,genshi_text,mdp,nbody,nqueens,pickle_pure_python,pidigits,regex_effbot,regex_v8,richards,scimark_fft,shortest_path,spectral_norm,sqlglot_v2_normalize,sympy_str,tomli_loads,unpack_sequence,xdsl_constant_fold,xml_etree_generate"
+
+# Default suite-D selection is the "quick" preset. Override with --pyperf-benches
+# (a list, "all", or a preset name) or --pyperf-reliable (shorthand for the
+# curated reliable preset).
+PYPERF_BENCHES="${PYPERF_BENCHES:-quick}"
+
+# Expand a preset name in $PYPERF_BENCHES to its concrete benchmark list. Only the
+# script's own preset names (quick / reliable / curated) are intercepted; anything
+# else (comma lists, "all", pyperformance group names, negative excludes) is left
+# untouched so pyperformance's native selection still works.
+resolve_pyperf_preset() {
+  case "$PYPERF_BENCHES" in
+    quick)            PYPERF_BENCHES="$PYPERF_PRESET_QUICK" ;;
+    reliable|curated) PYPERF_BENCHES="$PYPERF_PRESET_RELIABLE" ;;
+  esac
+}
 
 # fastmark work-scale factor (lower = faster; 100 is fastmark's default).
 FASTMARK_SCALE="${FASTMARK_SCALE:-100}"
@@ -123,6 +171,7 @@ PY_PREFIX="$WORKDIR/python-install"                # plain CPython (no CinderX l
 PY_PREFIX_STATIC="$WORKDIR/python-install-static"  # static CPython (builtin _cinderx)
 VENV="$WORKDIR/venv"                               # plain venv (dynamic CinderX built from source)
 VENV_STATIC="$WORKDIR/venv-static"                 # static venv (PythonLib via .pth)
+VENV_PIP="$WORKDIR/venv-pip"                       # pip venv (pre-built CinderX wheel from PyPI)
 RESULTS="$WORKDIR/results"
 JITLIST_DIR="$WORKDIR/jitlists/lists"
 HELPERS="$WORKDIR/helpers"
@@ -132,6 +181,7 @@ STATIC_BUILD_DIR="$WORKDIR/cinderx-static-build"   # cmake build tree for the Ci
 # Populated after the venvs exist.
 VPY=""           # plain venv python
 VPY_STATIC=""    # static venv python
+VPY_PIP=""       # pip venv python (pre-built PyPI CinderX wheel)
 
 # Populated by detect_toolchain(): a single C++20 toolchain used to build BOTH
 # CPython (./configure CC=/CXX=) and the CinderX archives, so their libstdc++/ABI
@@ -161,19 +211,22 @@ taskset_prefix() { if [ -n "$AFFINITY" ]; then printf 'taskset -c %s' "$AFFINITY
 usage() {
   cat <<'USAGE'
 cinderx-benchmark.sh — build plain + static CPython and benchmark CinderX
-across EIGHT configurations (static/dynamic linking × 4 JIT modes).
+across TWELVE configurations (source-dynamic / static-builtin / PyPI-wheel
+linkage × 4 JIT modes). Use --skip-pip to drop the wheel linkage (8-way).
 
 USAGE:
   bash cinderx-benchmark.sh --workdir DIR [OPTIONS]
 
   --workdir is REQUIRED (there is no default work directory). It runs the entire
   pipeline: build the plain CPython (PGO+LTO),
-  relink a second "static" CPython with _cinderx built in, create two benchmark
-  venvs (dynamic CinderX built from source + static PythonLib), generate JIT
-  lists, then run all four suites across all eight configurations and write
-  reports. CinderX is always built from source (with LTO) — never a PyPI wheel.
+  relink a second "static" CPython with _cinderx built in, create the benchmark
+  venvs (dynamic CinderX built from source + static PythonLib + a pip-installed
+  PyPI wheel unless --skip-pip), generate JIT lists, then run all four suites
+  across all configurations and write reports. The dynamic and static linkages
+  are always built from source (with LTO); the third "pip" linkage is the
+  pre-built PyPI wheel (LTO+PGO), which isolates the PGO effect.
 
-THE EIGHT CONFIGURATIONS (every suite runs each one):
+THE TWELVE CONFIGURATIONS (every suite runs each one; 9-12 dropped by --skip-pip):
   1. plain-off        plain CPython, CinderX not imported  (CINDERX_DISABLE=1)
   2. dyn-nojit        plain CPython, dynamic CinderX imported, JIT not enabled
   3. dyn-auto         plain CPython, dynamic CinderX, cinderx.jit.auto()
@@ -182,6 +235,10 @@ THE EIGHT CONFIGURATIONS (every suite runs each one):
   6. static-nojit     static CPython, CinderX imported, JIT not enabled
   7. static-auto      static CPython, cinderx.jit.auto()
   8. static-jitlist   static CPython, per-benchmark JIT lists
+  9. pip-off          plain CPython + PyPI wheel (LTO+PGO), not imported
+  10. pip-nojit       plain CPython + PyPI wheel, imported, JIT not enabled
+  11. pip-auto        plain CPython + PyPI wheel, cinderx.jit.auto()
+  12. pip-jitlist     plain CPython + PyPI wheel, per-benchmark JIT lists
 
 PHASE CONTROL (skip expensive phases to iterate; phases are also auto-skipped
 if their output already exists):
@@ -193,6 +250,12 @@ if their output already exists):
   --skip-fastmark        Skip suite B (fastmark / pyperformance via cinderx).
   --skip-static          Skip suite C (Static-Python variants).
   --skip-pyperf          Skip suite D (pyperformance).
+  --skip-pip             Omit the third "pip" venv (configs 9-12) entirely, making
+                         every suite 8-way again. By DEFAULT the pip venv is
+                         REQUIRED: the pre-built CinderX wheel is installed from
+                         PyPI (`pip install cinderx`) and a failed install ABORTS
+                         the run (there is no graceful offline skip). Pass this
+                         flag in offline environments or to skip the PGO wheel.
   --only-bench           Shorthand: skip all build/install/venv phases, just
                          run the benchmark suites against existing installs.
   --regen-jitlists       Force regeneration of JIT lists even if cached.
@@ -221,7 +284,28 @@ RUN TUNING:
   --affinity RANGE       Pin benchmark processes, e.g. "8-11" (default: none)
   --trials N             Repeats for built-in/static suites   (default: 3)
   --pyperf-mode MODE     "--fast" or "" for steady-state      (default: --fast)
-  --pyperf-benches LIST  Comma-separated pyperformance set for suite D.
+  --pyperf-benches SEL   pyperformance selection for suite D: a comma-separated
+                        list of benchmark/group names (optionally with negative
+                        "-name" excludes), the literal "all", or one of the named
+                        presets below.                        (default: quick)
+                          quick     10 high-signal benchmarks (5 prior JIT winners
+                                    + 5 prior regressions; the default).
+                          reliable  31-benchmark curated low-noise set from the
+                                    pyperf noise analysis (median within-config
+                                    CV < 3%), 11 workload types, mixing JIT winners
+                                    and JIT-neutral controls. Alias: curated.
+                          all       every pyperformance benchmark (~121).
+  --pyperf-reliable      Shorthand for --pyperf-benches reliable (the curated
+                        low-noise 31-benchmark set). The set:
+                          ascii85_small, async_tree_eager, base32_small,
+                          base85_small, bench_thread_pool, chameleon, chaos,
+                          connected_components, coroutines, docutils, dulwich_log,
+                          float, generators, genshi_text, mdp, nbody, nqueens,
+                          pickle_pure_python, pidigits, regex_effbot, regex_v8,
+                          richards, scimark_fft, shortest_path, spectral_norm,
+                          sqlglot_v2_normalize, sympy_str, tomli_loads,
+                          unpack_sequence, xdsl_constant_fold, xml_etree_generate
+  --pyperf-quick         Shorthand for --pyperf-benches quick (the default set).
   --fastmark-scale N     fastmark work scale (lower=faster)   (default: 100)
   --jit-threshold N      gen_jitlist hot threshold            (default: 2)
   --jit-budget SECS      gen_jitlist workload budget          (default: 3.0)
@@ -263,8 +347,9 @@ BOLT POST-LINK OPTIMIZATION (optional):
 ENVIRONMENT VARIABLES:
   Every option above has a matching env var (CPYTHON_TAG, CINDERX_TAG,
   WORKDIR, JOBS, AFFINITY, TRIALS, PYPERF_MODE, PYPERF_BENCHES, FASTMARK_SCALE,
-  JIT_THRESHOLD, JIT_BUDGET, FREE_THREADING, DO_BOLT, ...). CLI flags
-  take precedence over env vars.
+  JIT_THRESHOLD, JIT_BUDGET, FREE_THREADING, DO_BOLT, DO_PIP, ...). CLI flags
+  take precedence over env vars. DO_PIP=0 is equivalent to --skip-pip (the pip
+  venv is created and its wheel installed by default; DO_PIP=1).
   WORKDIR is required: set it via --workdir or the $WORKDIR env var (no default).
   CINDERX_CC / CINDERX_CXX override the auto-detected compiler used for BOTH
   CPython and the CinderX archives (the --cc / --cxx flags take precedence over
@@ -272,7 +357,7 @@ ENVIRONMENT VARIABLES:
 
 OUTPUT:
   Results, logs and markdown reports are written under  <workdir>/results/ .
-  A top-level SUMMARY.md links all per-suite 8-way reports.
+  A top-level SUMMARY.md links all per-suite reports (12-way, or 8-way with --skip-pip).
 
 REQUIREMENTS (must be pre-installed on a fresh box):
   git, make, a C++20 compiler (gcc 13+ or clang 18+), cmake + ninja + ar (the
@@ -283,6 +368,8 @@ EXAMPLES:
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --affinity 8-11 --trials 5
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --only-bench --skip-jitlists
+  bash cinderx-benchmark.sh --workdir ~/cinderx-bench --pyperf-reliable   # curated low-noise suite D
+  bash cinderx-benchmark.sh --workdir ~/cinderx-bench --pyperf-benches reliable --trials 5
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --bolt   # BOLT both binaries
   CPYTHON_TAG=v3.14.5 bash cinderx-benchmark.sh --workdir ~/cinderx-bench --cinderx-tag main
   bash cinderx-benchmark.sh --workdir ~/cinderx-bench --cinderx-repo /path/to/cinderx --cinderx-tag main
@@ -303,6 +390,7 @@ while [ $# -gt 0 ]; do
     --skip-fastmark)      RUN_FASTMARK=0 ;;
     --skip-static)        RUN_STATIC=0 ;;
     --skip-pyperf)        RUN_PYPERF=0 ;;
+    --skip-pip)           DO_PIP=0 ;;
     --only-bench)         DO_BUILD_CPYTHON=0; DO_INSTALL_CINDERX=0; DO_VENV=0 ;;
     --regen-jitlists)     REGEN_JITLISTS=1 ;;
     --free-threading|--disable-gil) FREE_THREADING=1 ;;
@@ -320,6 +408,8 @@ while [ $# -gt 0 ]; do
     --trials)             TRIALS="$2"; shift ;;
     --pyperf-mode)        PYPERF_MODE="$2"; shift ;;
     --pyperf-benches)     PYPERF_BENCHES="$2"; shift ;;
+    --pyperf-reliable)    PYPERF_BENCHES="reliable" ;;
+    --pyperf-quick)       PYPERF_BENCHES="quick" ;;
     --fastmark-scale)     FASTMARK_SCALE="$2"; shift ;;
     --jit-threshold)      JIT_THRESHOLD="$2"; shift ;;
     --jit-budget)         JIT_BUDGET="$2"; shift ;;
@@ -328,6 +418,10 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# Expand a preset name (quick / reliable / curated) in $PYPERF_BENCHES to its
+# concrete benchmark list. No-op for concrete selections and "all".
+resolve_pyperf_preset
 
 # --workdir is required (no default): a benchmark run creates large source/build
 # trees, so we never pick a directory on the user's behalf.
@@ -352,6 +446,7 @@ PY_PREFIX="$WORKDIR/python-install$FT_SUFFIX"
 PY_PREFIX_STATIC="$WORKDIR/python-install-static$FT_SUFFIX"
 VENV="$WORKDIR/venv$FT_SUFFIX"
 VENV_STATIC="$WORKDIR/venv-static$FT_SUFFIX"
+VENV_PIP="$WORKDIR/venv-pip$FT_SUFFIX"
 RESULTS="$WORKDIR/results$FT_SUFFIX"
 JITLIST_DIR="$WORKDIR/jitlists$FT_SUFFIX/lists"
 HELPERS="$WORKDIR/helpers$FT_SUFFIX"
@@ -380,11 +475,29 @@ ALL_CONFIGS=(
   "static-jitlist|static|BENCH_JITLIST_DIR=$JITLIST_DIR"
 )
 
+# The third linkage: the pre-built CinderX wheel (LTO+PGO) from PyPI, run on the
+# SAME plain interpreter as the dyn configs. Appended only when enabled (default),
+# turning the 8-way matrix into a 12-way one. --skip-pip (DO_PIP=0) drops these so
+# no suite tries to run them and the reports stay 8-way. The four pip configs
+# mirror the dyn configs' JIT-mode env exactly (off / no-jit / auto / jit-list).
+NWAY_LABEL="8-way"
+if [ "$DO_PIP" -eq 1 ]; then
+  CONFIG_ORDER="$CONFIG_ORDER,pip-off,pip-nojit,pip-auto,pip-jitlist"
+  ALL_CONFIGS+=(
+    "pip-off|pip|CINDERX_DISABLE=1"
+    "pip-nojit|pip|CINDERX_NO_JIT=1"
+    "pip-auto|pip|"
+    "pip-jitlist|pip|BENCH_JITLIST_DIR=$JITLIST_DIR"
+  )
+  NWAY_LABEL="12-way"
+fi
+
 # Resolve a config's venv-kind to its venv python interpreter.
 config_vpy() {
   case "$1" in
     plain)  printf '%s\n' "$VENV/bin/python" ;;
     static) printf '%s\n' "$VENV_STATIC/bin/python" ;;
+    pip)    printf '%s\n' "$VENV_PIP/bin/python" ;;
     *)      return 1 ;;
   esac
 }
@@ -1360,8 +1473,53 @@ install_cinderx_pythonlib() {
   ok "Pure-Python cinderx package on static venv path via $sp/cinderx_pythonlib.pth"
 }
 
+# Pip venv: install the PRE-BUILT CinderX wheel from PyPI (`pip install cinderx`).
+# This is the whole point of the third config: the PyPI wheel is built with
+# LTO+PGO, whereas our source builds (plain dynamic + static builtin) are LTO-only,
+# so the pip configs isolate the PGO effect against the source-built ones.
+#
+# REQUIRED by default (no graceful offline skip): if PyPI is unreachable or no
+# matching pre-built wheel exists for this interpreter, the whole run FAILS. Pass
+# --skip-pip (DO_PIP=0) to intentionally omit the pip venv (e.g. offline), in
+# which case this function is never reached (main gates it on DO_PIP).
+install_cinderx_pip() {
+  if [ "$DO_PIP" -eq 0 ]; then
+    warn "Skipping pip CinderX wheel install (--skip-pip)"; return
+  fi
+  [ -n "$VPY_PIP" ] || die "pip venv not ready (make_venvs must run first)"
+
+  # Idempotent: if the wheel is already importable in the pip venv, do nothing.
+  # Probe 'import cinderx.jit' (needs the native extension) — the bare package can
+  # import without the runtime, so the weaker probe would give a false positive.
+  if "$VPY_PIP" -c 'import cinderx.jit' >/dev/null 2>&1; then
+    local ever
+    ever="$("$VPY_PIP" -m pip show cinderx 2>/dev/null | awk '/^Version:/{print $2}')"
+    ok "pip venv already has CinderX ${ever:-unknown} (PyPI wheel); skipping install"
+    return
+  fi
+
+  log "Installing CinderX from PyPI (pre-built LTO+PGO wheel) into the pip venv"
+  # --only-binary :all: forces a real pre-built WHEEL — never an sdist that would
+  # compile from source (which would defeat the purpose of testing the PyPI wheel's
+  # LTO+PGO). REQUIRED: any failure here (offline, no compatible wheel, ...) aborts
+  # the run. The user must pass --skip-pip to opt out of the pip venv.
+  "$VPY_PIP" -m pip install --only-binary :all: cinderx \
+      >"$LOGDIR/cinderx_pip_install.log" 2>&1 \
+    || die "pip install cinderx FAILED (see $LOGDIR/cinderx_pip_install.log). The pip venv is REQUIRED by default — re-run with --skip-pip to omit it (e.g. offline), or restore PyPI/network access. No pre-built cinderx wheel for this interpreter also triggers this error."
+
+  # Verify the wheel actually provides a usable JIT (native _cinderx + package).
+  "$VPY_PIP" -c 'import cinderx.jit as j; print("pip cinderx OK")' \
+      >>"$LOGDIR/cinderx_verify.log" 2>&1 \
+    || die "CinderX PyPI wheel installed but 'import cinderx.jit' failed (see $LOGDIR/cinderx_verify.log); the wheel may be incompatible with this interpreter (ABI/version). Pass --skip-pip to omit the pip venv."
+
+  local ver
+  ver="$("$VPY_PIP" -m pip show cinderx 2>/dev/null | awk '/^Version:/{print $2}')"
+  ok "CinderX PyPI wheel (LTO+PGO) installed into the pip venv (version ${ver:-unknown})"
+}
+
 ###############################################################################
-# Phase 2: create the TWO benchmark venvs (plain + static) and install deps.
+# Phase 2: create the benchmark venvs (plain + static, and the pip venv unless
+# --skip-pip) and install deps.
 ###############################################################################
 
 # Create one benchmark venv from $1=interpreter-prefix at $2=venv-path and
@@ -1404,6 +1562,18 @@ make_venvs() {
   else
     create_one_venv "$PY_PREFIX_STATIC" "$VENV_STATIC" "static"
     VPY_STATIC="$VENV_STATIC/bin/python"
+  fi
+
+  # Pip venv: uses the SAME plain interpreter ($PY_PREFIX) as the plain venv, but
+  # the pre-built PyPI CinderX wheel goes in later via install_cinderx_pip. Only
+  # created when the pip config is enabled (default); --skip-pip omits it.
+  if [ "$DO_PIP" -eq 1 ]; then
+    if [ "$DO_VENV" -eq 0 ] && [ -x "$VENV_PIP/bin/python" ]; then
+      VPY_PIP="$VENV_PIP/bin/python"; ok "Reusing existing pip venv $VENV_PIP"
+    else
+      create_one_venv "$PY_PREFIX" "$VENV_PIP" "pip"
+      VPY_PIP="$VENV_PIP/bin/python"
+    fi
   fi
 }
 
@@ -1684,7 +1854,7 @@ run_builtin() {
   [ "$RUN_BUILTIN" -eq 1 ] || { warn "Skipping suite A (built-in)"; return; }
   local bdir; bdir="$(find_bench_dir)"
   [ -n "$bdir" ] && [ -d "$bdir" ] || { warn "cinderx benchmarks dir not found; skipping suite A"; return; }
-  log "Suite A: CinderX built-in lightweight benchmarks (8-way), $TRIALS trials"
+  log "Suite A: CinderX built-in lightweight benchmarks ($NWAY_LABEL), $TRIALS trials"
 
   local tsv="$RESULTS/builtin.tsv"
   printf 'name\tconfig\ttrial\tstatus\tseconds\n' > "$tsv"
@@ -1745,7 +1915,7 @@ run_builtin() {
     done
   done
   "$VPY" "$HELPERS/report_8way.py" "$tsv" \
-    "Suite A — CinderX built-in lightweight benchmarks (8-way)" \
+    "Suite A — CinderX built-in lightweight benchmarks ($NWAY_LABEL)" \
     "$RESULTS/REPORT_builtin.md" "$CONFIG_ORDER" >/dev/null
   ok "Suite A report: $RESULTS/REPORT_builtin.md"
 }
@@ -1765,7 +1935,7 @@ run_fastmark() {
   local bdir; bdir="$(find_bench_dir)"
   local fm="$bdir/fastmark.py"
   [ -n "$bdir" ] && [ -f "$fm" ] || { warn "fastmark.py not found; skipping suite B"; return; }
-  log "Suite B: fastmark (8-way, scale=$FASTMARK_SCALE)"
+  log "Suite B: fastmark ($NWAY_LABEL, scale=$FASTMARK_SCALE)"
 
   # fastmark.py runs ALL of its benchmarks in a SINGLE process and only writes its
   # --json at the very end, so one uncaught exception (e.g. a JIT/runtime bug that
@@ -1853,7 +2023,7 @@ PYEOF
   # Number of data rows beyond the header.
   if [ "$(wc -l < "$tsv")" -gt 1 ]; then
     "$VPY" "$HELPERS/report_8way.py" "$tsv" \
-      "Suite B — fastmark (pyperformance via cinderx) (8-way)" \
+      "Suite B — fastmark (pyperformance via cinderx) ($NWAY_LABEL)" \
       "$RESULTS/REPORT_fastmark.md" "$CONFIG_ORDER" >/dev/null
     ok "Suite B report: $RESULTS/REPORT_fastmark.md"
   else
@@ -1868,7 +2038,7 @@ run_static() {
   [ "$RUN_STATIC" -eq 1 ] || { warn "Skipping suite C (static)"; return; }
   local bdir; bdir="$(find_bench_dir)"
   [ -n "$bdir" ] && [ -d "$bdir" ] || { warn "cinderx benchmarks dir not found; skipping suite C"; return; }
-  log "Suite C: Static-Python variants vs non-static (8-way), $TRIALS trials"
+  log "Suite C: Static-Python variants vs non-static ($NWAY_LABEL), $TRIALS trials"
 
   local tsv="$RESULTS/static.tsv"
   # name = script (the kind, base vs static, is evident in the script name).
@@ -1924,7 +2094,7 @@ run_static() {
     done
   done
   "$VPY" "$HELPERS/report_8way.py" "$tsv" \
-    "Suite C — Static-Python variants vs non-static (8-way)" \
+    "Suite C — Static-Python variants vs non-static ($NWAY_LABEL)" \
     "$RESULTS/REPORT_static.md" "$CONFIG_ORDER" >/dev/null
   ok "Suite C report: $RESULTS/REPORT_static.md"
 }
@@ -1971,6 +2141,10 @@ print("PROBE loaded=%d jit=%d" % (loaded, jit))'
     esac
     case "$kind" in
       plain)  basepy="$PY_PREFIX/bin/python3" ;;
+      # pip configs run on the SAME plain interpreter as the dyn configs (CinderX
+      # comes from the pip-installed PyPI wheel, not a different build), so their
+      # base python is the plain install — identical to "plain".
+      pip)    basepy="$PY_PREFIX/bin/python3" ;;
       static) basepy="$PY_PREFIX_STATIC/bin/python3" ;;
       *)      warn "  $cname: unknown kind '$kind'"; rc=1; continue ;;
     esac
@@ -2011,7 +2185,7 @@ print("PROBE loaded=%d jit=%d" % (loaded, jit))'
 
 run_pyperf() {
   [ "$RUN_PYPERF" -eq 1 ] || { warn "Skipping suite D (pyperformance)"; return; }
-  log "Suite D: pyperformance (8-way), mode=${PYPERF_MODE:-steady}"
+  log "Suite D: pyperformance ($NWAY_LABEL), mode=${PYPERF_MODE:-steady}"
 
   local tag="$RESULTS/pyperf8way"
   local aff_opt=""
@@ -2122,7 +2296,7 @@ PYEOF
 
   if [ -s "$tsv" ] && [ "$(wc -l < "$tsv")" -gt 1 ]; then
     "$VPY" "$HELPERS/report_8way.py" "$tsv" \
-      "Suite D — pyperformance (8-way), mode=${PYPERF_MODE:-steady-state}, benches=$PYPERF_BENCHES" \
+      "Suite D — pyperformance ($NWAY_LABEL), mode=${PYPERF_MODE:-steady-state}, benches=$PYPERF_BENCHES" \
       "$RESULTS/REPORT_pyperf8way.md" "$CONFIG_ORDER" >/dev/null
     # Append per-benchmark pyperformance compare tables vs the plain-off baseline.
     {
@@ -2153,18 +2327,24 @@ PYEOF
 # Final summary.
 ###############################################################################
 write_summary() {
-  local py_ver py_ver_static dyn_ver static_ver
+  local py_ver py_ver_static dyn_ver static_ver pip_ver
   py_ver="$([ -x "$PY_PREFIX/bin/python3" ] && "$PY_PREFIX/bin/python3" -V 2>&1 || echo unknown)"
   py_ver_static="$([ -x "$PY_PREFIX_STATIC/bin/python3" ] && "$PY_PREFIX_STATIC/bin/python3" -V 2>&1 || echo unknown)"
   dyn_ver="$([ -n "$VPY" ] && [ -x "$VPY" ] && "$VPY" -m pip show cinderx 2>/dev/null | awk '/^Version:/{print $2}' || echo unknown)"
   static_ver="$([ -d "$SRC_CINDERX/.git" ] && git -C "$SRC_CINDERX" describe --always 2>/dev/null || echo "$CINDERX_TAG")"
+  pip_ver="$([ "$DO_PIP" -eq 1 ] && [ -n "$VPY_PIP" ] && [ -x "$VPY_PIP" ] && "$VPY_PIP" -m pip show cinderx 2>/dev/null | awk '/^Version:/{print $2}' || echo unknown)"
   {
-    echo "# CinderX benchmark run — SUMMARY (8-way)"
+    echo "# CinderX benchmark run — SUMMARY ($NWAY_LABEL)"
     echo
     echo "- **Plain CPython:** $py_ver (PGO+LTO build at \`$PY_PREFIX\`)"
     echo "- **Static CPython:** $py_ver_static (builtin _cinderx at \`$PY_PREFIX_STATIC\`)"
-    echo "- **Dynamic CinderX:** ${dyn_ver:-unknown} (built from source into \`$VENV\`)"
-    echo "- **Static CinderX:** ${static_ver:-unknown} (builtin _cinderx + PythonLib in \`$VENV_STATIC\`)"
+    echo "- **Dynamic CinderX:** ${dyn_ver:-unknown} (built from source, LTO-only, into \`$VENV\`)"
+    echo "- **Static CinderX:** ${static_ver:-unknown} (builtin _cinderx + PythonLib, LTO-only, in \`$VENV_STATIC\`)"
+    if [ "$DO_PIP" -eq 1 ]; then
+      echo "- **Pip CinderX:** ${pip_ver:-unknown} (pre-built PyPI wheel, LTO+PGO, on the plain interpreter in \`$VENV_PIP\`)"
+    else
+      echo "- **Pip CinderX:** skipped (\`--skip-pip\`)"
+    fi
     echo "- **Affinity:** ${AFFINITY:-none}   **Trials:** $TRIALS   **pyperf mode:** ${PYPERF_MODE:-steady-state}"
     if [ "$DO_BOLT" -eq 1 ]; then
       # Report whether each interpreter actually carries a BOLTed layout. Built-in
@@ -2189,7 +2369,13 @@ write_summary() {
     echo "- **Generated:** $(date)"
     echo
     echo "## Configurations"
-    echo "Every suite runs each of these eight, controlled by env-driven sitecustomize:"
+    if [ "$DO_PIP" -eq 1 ]; then
+      echo "Every suite runs each of these twelve, controlled by env-driven sitecustomize."
+      echo "The three linkages isolate the optimization effects: source-built dynamic"
+      echo "(LTO only) and static-builtin (LTO only) vs the PyPI wheel (LTO **+ PGO**)."
+    else
+      echo "Every suite runs each of these eight, controlled by env-driven sitecustomize:"
+    fi
     echo
     echo "| # | config | interpreter | CinderX / JIT mode |"
     echo "|---|---|---|---|"
@@ -2201,13 +2387,19 @@ write_summary() {
     echo "| 6 | static-nojit    | static | imported, JIT off (CINDERX_NO_JIT=1) |"
     echo "| 7 | static-auto     | static | cinderx.jit.auto() |"
     echo "| 8 | static-jitlist  | static | per-benchmark JIT lists |"
+    if [ "$DO_PIP" -eq 1 ]; then
+      echo "| 9  | pip-off         | pip (plain interp) | not imported (CINDERX_DISABLE=1) |"
+      echo "| 10 | pip-nojit       | pip (plain interp) | imported, JIT off (CINDERX_NO_JIT=1) |"
+      echo "| 11 | pip-auto        | pip (plain interp) | cinderx.jit.auto() |"
+      echo "| 12 | pip-jitlist     | pip (plain interp) | per-benchmark JIT lists |"
+    fi
     echo
     echo "## Reports"
     for r in REPORT_builtin REPORT_fastmark REPORT_static REPORT_pyperf8way; do
       [ -f "$RESULTS/$r.md" ] && echo "- [${r#REPORT_}]($r.md)"
     done
     echo
-    echo "## Method (per suite, all 8-way; baseline column = plain-off)"
+    echo "## Method (per suite, all $NWAY_LABEL; baseline column = plain-off)"
     echo "- **A. Built-in:** lightweight cinderx benchmarks, min wall-clock over $TRIALS trials."
     echo "- **B. fastmark:** pyperformance workloads via cinderx/benchmarks/fastmark.py (env-driven, scale=$FASTMARK_SCALE)."
     echo "- **C. Static variants:** plain vs Static-Python scripts (static/strict compile runs even when JIT off)."
@@ -2225,22 +2417,28 @@ main() {
   write_helpers
   build_cpython          # plain CPython  -> $PY_PREFIX
   build_static_cpython   # static CPython (builtin _cinderx) -> $PY_PREFIX_STATIC
-  make_venvs             # creates/locates both VPY (plain) and VPY_STATIC (static)
+  make_venvs             # creates/locates VPY (plain), VPY_STATIC (static), VPY_PIP (pip unless --skip-pip)
   # If we skipped venv creation but need the python paths, locate them.
   [ -n "$VPY" ]        || { [ -x "$VENV/bin/python" ]        && VPY="$VENV/bin/python"; }
   [ -n "$VPY_STATIC" ] || { [ -x "$VENV_STATIC/bin/python" ] && VPY_STATIC="$VENV_STATIC/bin/python"; }
   [ -n "$VPY" ]        || die "No usable plain venv python; run without --skip-venv first"
   [ -n "$VPY_STATIC" ] || die "No usable static venv python; run without --skip-venv first"
-  # Ensure sitecustomize is present in both venvs (cheap, idempotent) even on --skip-venv.
+  if [ "$DO_PIP" -eq 1 ]; then
+    [ -n "$VPY_PIP" ] || { [ -x "$VENV_PIP/bin/python" ] && VPY_PIP="$VENV_PIP/bin/python"; }
+    [ -n "$VPY_PIP" ] || die "No usable pip venv python; run without --skip-venv first (or pass --skip-pip to omit the pip config)"
+  fi
+  # Ensure sitecustomize is present in every venv (cheap, idempotent) even on --skip-venv.
   if [ -f "$HELPERS/sitecustomize.py" ]; then
     install_sitecustomize "$VPY"
     install_sitecustomize "$VPY_STATIC"
+    [ "$DO_PIP" -eq 1 ] && [ -n "$VPY_PIP" ] && install_sitecustomize "$VPY_PIP"
   fi
   # The static venv needs the CinderX source for its PythonLib .pth; the suites
   # also run benchmark scripts from the source tree (not shipped in the wheel).
   ensure_cinderx_source
   install_cinderx            # source-built dynamic CinderX into the plain venv (configs 2-4)
   install_cinderx_pythonlib  # PythonLib .pth into the static venv (configs 6-8)
+  install_cinderx_pip        # pre-built PyPI wheel into the pip venv (configs 9-12; REQUIRED unless --skip-pip)
   gen_jitlists               # generated once with the plain venv; shared by both
   run_builtin
   run_fastmark
