@@ -9,9 +9,16 @@
 #
 #   1. Clone CPython and build it with PGO + LTO into a local prefix (the "plain"
 #      CPython, with no CinderX linked in).
-#   2. Build the CinderX static archives and relink CPython into a SECOND prefix
-#      (the "static" CPython, with _cinderx as a builtin module). Only one PGO
-#      build runs — the static binary is a `make python` relink of the same tree.
+#   2. Source-list CinderX's own C/C++ files in Modules/Setup.local and rebuild
+#      CPython into a SECOND prefix (the "static" CPython, with _cinderx as a
+#      builtin) so CPython's own make compiles CinderX under its LTO and PGO; only
+#      the cold third-party libs (asmjit/fmt/capstone) stay pre-built .a from cmake.
+#      Requires a small makesetup/Makefile.pre.in patch (auto-applied) to compile
+#      C++ builtin-module sources. With CinderX now in the tree, the static build
+#      runs its OWN full PGO cycle (`make profile-opt`) whose PROFILE_TASK trains
+#      BOTH CPython (the stdlib test suite) AND CinderX+JIT (a representative JIT
+#      workload), so the static binary's CinderX code is PGO-optimized on real
+#      counts — not just relinked against the plain build's CinderX-free profile.
 #   3. Create THREE benchmark virtualenvs and install pyperformance + the fastmark
 #      benchmark dependencies in each. The dynamic and static linkages build
 #      CinderX from source (with LTO); the third is the pre-built PyPI wheel:
@@ -573,6 +580,114 @@ preflight() {
 write_helpers() {
   log "Writing embedded helpers to $HELPERS"
 
+  # --- harvest_cinderx_build.py : source + flag harvester ----------------
+  # Parse a cmake compile_commands.json and emit (a) the list of CinderX's OWN
+  # source files (excluding vendored ThirdParty/, downloaded _deps/, tests, and
+  # benchmarks) as paths relative to Modules/ (cinderx/<rel>), and (b) the union
+  # of the compile flags CinderX uses, minus flags CPython supplies itself
+  # (optimization/LTO/PGO/dep-gen/-c/-o and the installed-Python includes). Used
+  # by build_static_cpython() to source-list CinderX in Modules/Setup.local so
+  # CPython's own make compiles it under PGO+LTO. See the [[research]] task notes.
+  cat > "$HELPERS/harvest_cinderx_build.py" <<'PYEOF'
+#!/usr/bin/env python3
+# Harvest compile flags + source list for CinderX's OWN code from a cmake
+# compile_commands.json, for source-listing in CPython's Modules/Setup.local.
+#
+# Usage: harvest_cinderx_build.py <compile_commands.json> <pkg_root> <out_flags> <out_srcs>
+#   pkg_root = the CinderX package dir ($SRC_CINDERX/cinderx) used to identify
+#              and relativise CinderX-owned sources.
+# Emits:
+#   out_flags  one line: union of compile flags across all CinderX-owned compiles,
+#              minus flags CPython supplies itself (-c/-o/dep-gen/-flto*/-fprofile*/
+#              -O*/-g and the input file) and the installed-Python includes. Only
+#              the C++ -std is kept (C sources get -std=c11 from CPython's C path;
+#              a C++ -std on a C compile is an ignored warning).
+#   out_srcs   one path per line relative to Modules/ (e.g. cinderx/Jit/foo.cpp)
+#              for every CinderX-owned source (excludes third-party _deps, vendored
+#              ThirdParty/, tests, benchmarks).
+import json, os, sys, shlex
+
+cc_json, pkg_root, out_flags, out_srcs = sys.argv[1:5]
+pkg_root = os.path.normpath(pkg_root)            # $SRC_CINDERX/cinderx (package dir)
+
+with open(cc_json) as f:
+    entries = json.load(f)
+
+EXCLUDE_PREFIXES = ("ThirdParty/", "RuntimeTests/", "benchmarks/", "tools/",
+                    "TestScripts/", "Docs/", "PythonBin/")
+TWO_TOKEN_KEEP = {"-isystem", "-iquote", "-idirafter", "-include", "-imacros", "-isysroot"}
+TWO_TOKEN_DROP = {"-o", "-MF", "-MT", "-MQ", "-x", "-MJ"}
+DROP_PREFIX = ("-flto", "-fprofile", "-fuse-linker-plugin", "-ffat-lto-objects",
+               "-O", "-MD", "-MMD", "-MP", "-MG", "-Wp,-MD", "-Wp,-MMD",
+               "-fdiagnostics-color", "-fcolor-diagnostics")
+PY_INC_RE = "/include/python"                     # CPython's own in-tree headers must win
+
+def is_py_include_path(p):
+    return PY_INC_RE in p
+
+def drop_single(tok):
+    if tok.startswith("-I") and is_py_include_path(tok[2:]):
+        return True                               # drop installed-Python -I; CPython supplies in-tree
+    if tok in ("-c", "-g"):
+        return True
+    if "lto" in tok:                              # any -f...lto... variant
+        return True
+    if tok.startswith("-std="):
+        return "++" not in tok                     # drop C stds; keep only the C++ std
+    for p in DROP_PREFIX:
+        if tok.startswith(p):
+            return True
+    return False
+
+flags = []; seen = set()
+def add(tok):
+    if tok and tok not in seen:
+        seen.add(tok); flags.append(tok)
+def add_pair(flag, val):
+    key = flag + "\x00" + val                     # dedupe on the (flag,value) pair
+    if key not in seen:
+        seen.add(key); flags.append(flag); flags.append(val)
+
+srcs = []; srcseen = set()
+
+for e in entries:
+    fpath = os.path.normpath(e.get("file", ""))
+    if not (fpath == pkg_root or fpath.startswith(pkg_root + os.sep)):
+        continue                                  # not under package dir (skips _deps, build/generated dummies)
+    rel = os.path.relpath(fpath, pkg_root)
+    if any(rel.startswith(p) for p in EXCLUDE_PREFIXES):
+        continue                                  # vendored / tests / etc.
+    tok = "cinderx/" + rel.replace(os.sep, "/")
+    if tok not in srcseen:
+        srcseen.add(tok); srcs.append(tok)
+    args = list(e["arguments"]) if e.get("arguments") else shlex.split(e.get("command", ""))
+    args = args[1:]                               # drop compiler argv[0]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in TWO_TOKEN_DROP:
+            i += 2; continue
+        if a in TWO_TOKEN_KEEP:
+            if i + 1 < len(args):
+                if not is_py_include_path(args[i+1]):
+                    add_pair(a, args[i+1])
+                i += 2; continue
+            i += 1; continue
+        if a == fpath or os.path.normpath(a) == fpath or a.startswith("-o"):
+            i += 1; continue
+        if drop_single(a):
+            i += 1; continue
+        if a.startswith(("-I", "-D", "-U", "-std=", "-f", "-W", "-m", "-pthread", "-B")):
+            add(a)
+        i += 1
+
+with open(out_flags, "w") as f:
+    f.write(" ".join(flags) + "\n")
+with open(out_srcs, "w") as f:
+    f.write("\n".join(srcs) + ("\n" if srcs else ""))
+print(f"harvested {len(srcs)} sources, {len(flags)} flag tokens", file=sys.stderr)
+PYEOF
+
   # --- gen_jitlist.py : per-benchmark JIT-list generator ------------------
   cat > "$HELPERS/gen_jitlist.py" <<'PYEOF'
 #!/usr/bin/env python3
@@ -1002,12 +1117,352 @@ def get_compile_after_n_calls(*args, **kwargs):
     return None
 PYEOF
 
+  # --- pgo_cinderx_train.py : combined PGO training driver ----------------
+  # Run by CPython as its PROFILE_TASK ( ./python pgo_cinderx_train.py ) during the
+  # STATIC build's -fprofile-generate instrumented phase (see build_static_cpython).
+  # It trains BOTH halves of the static interpreter, each in its OWN subprocess so
+  # their profile data is captured independently (clang: a unique
+  # code-<pid>.profclangr via the inherited LLVM_PROFILE_FILE=...%p... pattern; gcc:
+  # .gcda accumulate next to each object):
+  #   1. standard CPython paths -> the stdlib regression suite (-m test --pgo)
+  #   2. CinderX runtime + JIT  -> cinderx_jit_workload.py (imports cinderx, enables
+  #      the JIT, compiles+runs representative kernels)
+  # The instrumented ./python has _cinderx builtin, so half 2 records REAL counts
+  # for the source-listed CinderX objects — the coverage the plain PROFILE_TASK
+  # (which ran before CinderX was in the tree and never enabled the JIT) never had.
+  cat > "$HELPERS/pgo_cinderx_train.py" <<'PYEOF'
+#!/usr/bin/env python3
+# PGO training driver for the static CinderX build (used as CPython's PROFILE_TASK).
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PY = sys.executable
+
+
+def run(argv, label):
+    print(f"[pgo-train] {label}: {PY} {' '.join(argv)}", flush=True)
+    # A nonzero rc (e.g. a flaky test) still produced useful profile data, so we
+    # mirror upstream's tolerance and never abort the PGO run on it.
+    rc = subprocess.call([PY, *argv])
+    print(f"[pgo-train] {label}: exit {rc}", flush=True)
+
+
+# 1. Standard CPython PGO training. Default mirrors upstream's PROFILE_TASK; the
+#    exact selection can be overridden via CINDERX_PGO_TEST_ARGS.
+test_args = os.environ.get("CINDERX_PGO_TEST_ARGS", "-m test --pgo").split()
+run(test_args, "cpython-testsuite")
+
+# 2. CinderX + JIT training workload (imports cinderx, enables the JIT, compiles
+#    and runs representative kernels so the instrumented CinderX objects get counts).
+run([os.path.join(HERE, "cinderx_jit_workload.py")], "cinderx-jit")
+
+print("[pgo-train] all training phases complete", flush=True)
+PYEOF
+
+  # --- cinderx_jit_workload.py : representative CinderX+JIT training -------
+  # Spawned by pgo_cinderx_train.py during PGO instrumentation. Enables the JIT and
+  # exercises BOTH:
+  #   * the JIT COMPILER (HIR/LIR passes, register allocator) via force_compile()
+  #   * JIT-compiled EXECUTION (the PEP 523 eval-frame hook, JIT entry/exit) by
+  #     running each compiled kernel many times
+  # across a spread of function shapes (compute/recursion, object dispatch,
+  # generators, containers, exceptions). Self-contained (stdlib only): it runs
+  # inside the CPython build tree before any benchmark venv exists.
+  cat > "$HELPERS/cinderx_jit_workload.py" <<'PYEOF'
+#!/usr/bin/env python3
+# CinderX + JIT PGO training workload. See build_static_cpython() in cinderx-benchmark.sh.
+import sys
+
+try:
+    import cinderx  # noqa: F401  (initialises the CinderX runtime)
+    import cinderx.jit as jit
+except Exception as e:  # pragma: no cover
+    print(f"[jit-workload] cinderx unavailable: {e!r}", file=sys.stderr)
+    sys.exit(0)  # CPython core paths were already trained; don't break the PGO run
+
+try:
+    jit.enable()
+except Exception as e:
+    print(f"[jit-workload] jit.enable() failed: {e!r}", file=sys.stderr)
+
+# If the JIT isn't actually compiled into this interpreter there is nothing to
+# train; exit cleanly (CPython core paths were trained by the test-suite phase).
+if not getattr(jit, "is_enabled", lambda: False)():
+    print("[jit-workload] JIT not available/enabled in this build; skipping JIT training",
+          file=sys.stderr)
+    sys.exit(0)
+
+# Turn on extra compiler passes so their code is exercised under instrumentation.
+for _opt in ("enable_hir_inliner", "enable_specialized_opcodes"):
+    try:
+        getattr(jit, _opt)()
+    except Exception:
+        pass
+try:
+    jit.compile_after_n_calls(1)  # auto-compile anything that gets called
+except Exception:
+    pass
+
+
+# --- compute: recursion + integer/float arithmetic ------------------------
+def fib(n):
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+def collatz_len(n):
+    steps = 0
+    while n != 1:
+        n = n // 2 if n % 2 == 0 else 3 * n + 1
+        steps += 1
+    return steps
+
+
+def float_kernel(n):
+    total = 0.0
+    for i in range(1, n + 1):
+        total += (i * 1.5) / (i + 0.5) - (i ** 0.5)
+    return total
+
+
+# --- object dispatch: attributes, methods, polymorphism -------------------
+class Vec:
+    __slots__ = ("x", "y", "z")
+
+    def __init__(self, x, y, z):
+        self.x = x
+        self.y = y
+        self.z = z
+
+    def dot(self, o):
+        return self.x * o.x + self.y * o.y + self.z * o.z
+
+    def scale(self, k):
+        return Vec(self.x * k, self.y * k, self.z * k)
+
+
+class Shape:
+    def area(self):
+        return 0.0
+
+
+class Circle(Shape):
+    def __init__(self, r):
+        self.r = r
+
+    def area(self):
+        return 3.14159 * self.r * self.r
+
+
+class Square(Shape):
+    def __init__(self, s):
+        self.s = s
+
+    def area(self):
+        return self.s * self.s
+
+
+def dispatch_kernel(n):
+    shapes = [Circle(1.5), Square(2.0), Circle(0.5), Square(3.0)]
+    acc = 0.0
+    for i in range(n):
+        acc += shapes[i % len(shapes)].area()
+    v = Vec(1.0, 2.0, 3.0)
+    for _ in range(n):
+        v = v.scale(1.0000001)
+        acc += v.dot(v)
+    return acc
+
+
+# --- generators / iterators ----------------------------------------------
+def gen_squares(n):
+    for i in range(n):
+        yield i * i
+
+
+def gen_kernel(n):
+    return sum(x for x in gen_squares(n))
+
+
+# --- containers: dict/list/set/comprehensions -----------------------------
+def container_kernel(n):
+    d = {}
+    for i in range(n):
+        d[i % 97] = d.get(i % 97, 0) + i
+    lst = [i * i for i in range(n) if i % 3]
+    s = {x % 13 for x in lst}
+    return len(d) + len(lst) + len(s)
+
+
+# --- exceptions -----------------------------------------------------------
+def exc_kernel(n):
+    caught = 0
+    for i in range(n):
+        try:
+            if i % 5 == 0:
+                raise ValueError(i)
+            _ = 1 / (i % 7 or 1)
+        except ValueError:
+            caught += 1
+        except ZeroDivisionError:
+            caught += 1
+    return caught
+
+
+FUNCS = [fib, collatz_len, float_kernel, dispatch_kernel,
+         gen_kernel, container_kernel, exc_kernel]
+
+# 1) Drive the JIT COMPILER directly (deterministic, threshold-independent).
+compiled = 0
+for f in FUNCS:
+    try:
+        if jit.force_compile(f):
+            compiled += 1
+    except Exception as e:
+        print(f"[jit-workload] force_compile({f.__name__}) failed: {e!r}",
+              file=sys.stderr)
+
+# 2) Drive JIT-compiled EXECUTION: run each kernel repeatedly so the eval-frame
+#    hook + JIT entry/exit + the compiled bodies are heavily exercised.
+for _ in range(3):
+    fib(28)
+    for n in (2000, 5000):
+        collatz_len(n)
+        float_kernel(n)
+        dispatch_kernel(n)
+        gen_kernel(n)
+        container_kernel(n)
+        exc_kernel(n)
+
+try:
+    n_comp = len(jit.get_compiled_functions())
+except Exception:
+    n_comp = -1
+print(f"[jit-workload] done: force_compiled={compiled} total_compiled={n_comp}",
+      flush=True)
+PYEOF
+
   ok "Helpers written"
 }
 
 ###############################################################################
 # Phase 1: build CPython with PGO + LTO.
 ###############################################################################
+# ---------------------------------------------------------------------------
+# Patch the CPython build system so makesetup can compile C++ extension-module
+# sources with C++-appropriate flags. Stock CPython hardcodes
+# $(PY_BUILTIN_MODULE_CFLAGS) — which carries C-only -std=c11 / -Wstrict-prototypes
+# / -Werror=implicit-function-declaration — onto EVERY builtin-module source,
+# including .cpp, so a C++ source cannot be listed in Modules/Setup (a C++
+# compiler rejects -std=c11). This adds PY_{STDMODULE,BUILTIN_MODULE}_CXXFLAGS
+# (the C flags with those three C-only tokens filtered out) and makes makesetup
+# use them for C++ sources. It preserves BASECFLAGS/OPT/LTO/PGO (PGO/LTO ride on
+# CFLAGS_NODIST, which stays inside PY_STDMODULE_CFLAGS) — the C++ language
+# standard itself comes from the module's own CFLAGS (CinderX supplies -std=c++20).
+#
+# Applied with `patch -p1` from the unified diff embedded in the function below
+# (verified to apply cleanly to v3.14.5 with both `git apply` and `patch -p1`).
+# Idempotent: a forward `patch -N --dry-run` gates re-application, so re-running
+# against an already-patched tree is a no-op.
+# ---------------------------------------------------------------------------
+apply_cpython_cxx_patch() {
+  local tree="$1"
+  local mk="$tree/Makefile.pre.in" ms="$tree/Modules/makesetup"
+  [ -f "$mk" ] || die "apply_cpython_cxx_patch: $mk not found"
+  [ -f "$ms" ] || die "apply_cpython_cxx_patch: $ms not found"
+
+  # The unified diff (verified to apply cleanly to v3.14.5 with both `git apply`
+  # and `patch -p1`) is embedded here so this file stays self-contained — there
+  # is no companion .patch to copy alongside it.
+  local cxx_patch
+  cxx_patch=$(cat <<'PATCH_EOF'
+--- a/Makefile.pre.in
++++ b/Makefile.pre.in
+@@ -121,6 +121,13 @@
+ # C flags used for building the interpreter object files
+ PY_STDMODULE_CFLAGS= $(PY_CFLAGS) $(PY_CFLAGS_NODIST) $(PY_CPPFLAGS) $(CFLAGSFORSHARED)
+ PY_BUILTIN_MODULE_CFLAGS= $(PY_STDMODULE_CFLAGS) -DPy_BUILD_CORE_BUILTIN
++# C++ variants of the module CFLAGS: drop C-only flags a C++ compiler rejects
++# (-std=c11) or that are invalid/erroring under C++ (-Wstrict-prototypes,
++# -Werror=implicit-function-declaration). Used by makesetup for C++ extension
++# module sources. The C++ language standard comes from the module's own CFLAGS
++# (e.g. -std=c++20); PGO/LTO flags live in CFLAGS_NODIST and are preserved.
++PY_STDMODULE_CXXFLAGS= $(filter-out -std=c11 -Wstrict-prototypes -Werror=implicit-function-declaration,$(PY_STDMODULE_CFLAGS))
++PY_BUILTIN_MODULE_CXXFLAGS= $(PY_STDMODULE_CXXFLAGS) -DPy_BUILD_CORE_BUILTIN
+ PY_CORE_CFLAGS=	$(PY_STDMODULE_CFLAGS) -DPy_BUILD_CORE
+ # Linker flags used for building the interpreter object files
+ PY_CORE_LDFLAGS=$(PY_LDFLAGS) $(PY_LDFLAGS_NODIST)
+--- a/Modules/makesetup
++++ b/Modules/makesetup
+@@ -228,13 +228,13 @@
+ 		for src in $srcs
+ 		do
+ 			case $src in
+-			*.c)   obj=`basename $src .c`.o; cc='$(CC)';;
+-			*.cc)  obj=`basename $src .cc`.o; cc='$(CXX)';;
+-			*.c++) obj=`basename $src .c++`.o; cc='$(CXX)';;
+-			*.C)   obj=`basename $src .C`.o; cc='$(CXX)';;
+-			*.cxx) obj=`basename $src .cxx`.o; cc='$(CXX)';;
+-			*.cpp) obj=`basename $src .cpp`.o; cc='$(CXX)';;
+-			*.m)   obj=`basename $src .m`.o; cc='$(CC)';; # Obj-C
++			*.c)   obj=`basename $src .c`.o; cc='$(CC)'; iscxx=no;;
++			*.cc)  obj=`basename $src .cc`.o; cc='$(CXX)'; iscxx=yes;;
++			*.c++) obj=`basename $src .c++`.o; cc='$(CXX)'; iscxx=yes;;
++			*.C)   obj=`basename $src .C`.o; cc='$(CXX)'; iscxx=yes;;
++			*.cxx) obj=`basename $src .cxx`.o; cc='$(CXX)'; iscxx=yes;;
++			*.cpp) obj=`basename $src .cpp`.o; cc='$(CXX)'; iscxx=yes;;
++			*.m)   obj=`basename $src .m`.o; cc='$(CC)'; iscxx=no;; # Obj-C
+ 			*)     continue;;
+ 			esac
+ 			case $src in
+@@ -251,12 +251,20 @@
+ 			# custom flags first, PY_STDMODULE_CFLAGS may contain -I with system libmpdec
+ 			case $doconfig in
+ 			no)
+-				cc="$cc $cpps \$(PY_STDMODULE_CFLAGS) \$(CCSHARED)"
++				if test "$iscxx" = yes; then
++					cc="$cc $cpps \$(PY_STDMODULE_CXXFLAGS) \$(CCSHARED)"
++				else
++					cc="$cc $cpps \$(PY_STDMODULE_CFLAGS) \$(CCSHARED)"
++				fi
+ 				rule="$obj: $src \$(MODULE_${mods_upper}_DEPS) \$(MODULE_DEPS_SHARED) \$(PYTHON_HEADERS)"
+ 				rule="$rule; $cc -c $src -o $obj"
+ 				;;
+ 			*)
+-				cc="$cc $cpps \$(PY_BUILTIN_MODULE_CFLAGS)"
++				if test "$iscxx" = yes; then
++					cc="$cc $cpps \$(PY_BUILTIN_MODULE_CXXFLAGS)"
++				else
++					cc="$cc $cpps \$(PY_BUILTIN_MODULE_CFLAGS)"
++				fi
+ 				rule="$obj: $src \$(MODULE_${mods_upper}_DEPS) \$(MODULE_DEPS_STATIC) \$(PYTHON_HEADERS)"
+ 				rule="$rule; $cc -c $src -o $obj"
+ 				;;
+PATCH_EOF
+)
+
+  # Idempotent: a forward `patch -N --dry-run` fails once the patch is present.
+  # Use it as the gate — if the dry-run cannot apply, distinguish "already
+  # applied" (marker present) from a genuine mismatch and act accordingly.
+  if ! printf '%s\n' "$cxx_patch" | patch -p1 -N --dry-run -d "$tree" >/dev/null 2>&1; then
+    if grep -q 'PY_BUILTIN_MODULE_CXXFLAGS' "$mk" 2>/dev/null; then
+      ok "CPython C++ makesetup patch already applied; skipping"
+      return
+    fi
+    die "CPython C++ patch does not apply cleanly to $tree (see above)"
+  fi
+
+  log "Patching CPython build system for C++ builtin-module sources ($mk + $ms)"
+  printf '%s\n' "$cxx_patch" | patch -p1 -N -d "$tree" \
+    || die "CPython C++ patch failed (see error above)"
+  grep -q 'PY_BUILTIN_MODULE_CXXFLAGS' "$mk" || die "patch verify failed: PY_BUILTIN_MODULE_CXXFLAGS missing in $mk"
+  grep -q 'iscxx' "$ms" || die "patch verify failed: iscxx marker missing in $ms"
+  ok "CPython C++ makesetup patch applied"
+}
+
 build_cpython() {
   if [ "$DO_BUILD_CPYTHON" -eq 0 ]; then
     warn "Skipping CPython build (--skip-build-cpython)"; return
@@ -1033,6 +1488,12 @@ build_cpython() {
   else
     ok "CPython checkout already present at $SRC_CPYTHON"
   fi
+
+  # Patch the build system for C++ builtin-module sources BEFORE ./configure, so
+  # the regenerated Makefile/makesetup can compile CinderX's C++ sources (listed
+  # in Modules/Setup.local by build_static_cpython) under CPython's own PGO+LTO.
+  # Idempotent and harmless to the plain build (no C++ builtin sources yet).
+  apply_cpython_cxx_patch "$SRC_CPYTHON"
 
   # Build CPython with the SAME compiler we use for the CinderX archives so their
   # libstdc++ versions match. configure records CC/CXX in the Makefile, so the
@@ -1090,17 +1551,27 @@ build_cpython() {
 # Phase 1b: build the SECOND, static CPython (builtin _cinderx) into its own
 # prefix. Always runs (the static interpreter is no longer optional).
 #
-# CinderX's cmake already bundles all module logic into libcinderx-lib.a + a set
-# of static sub-archives; the only thing missing for a builtin module is the
-# PyInit__cinderx entry point (normally compiled straight into _cinderx.so). We
-# build the .a's from source, compile a tiny PyInit__cinderx wrapper out-of-band
-# (makesetup's .cpp rule injects C-only -std=c11 that a C++ compiler rejects),
-# declare _cinderx in Modules/Setup.local with all archives wrapped in
-# --start-group/--end-group (they have circular refs), and relink with
-# `make python`. The plain prefix is then copied to the static prefix and its
-# interpreter binary swapped for the relinked one (CPython is a static-libpython
-# build, so copying the binary suffices). The pure-Python cinderx package is
-# added to the static venv separately (install_cinderx_pythonlib).
+# HYBRID source-listing approach: instead of pre-compiling all of CinderX with
+# cmake and linking the finished .a's (which leaves CinderX OUTSIDE CPython's
+# PGO training and LTO), we list CinderX's OWN ~145 C/C++ sources directly in
+# Modules/Setup.local so CPython's own `make` compiles them — putting them under
+# the same PGO profile + LTO unit as the interpreter (cross-boundary inlining of
+# the PEP523/eval-frame hook becomes possible). cmake is still used to CONFIGURE
+# (download fmt/capstone/parallel-hashmap/usdt, generate the opcode/usdt headers,
+# and emit compile_commands.json) and to build ONLY the third-party static libs
+# (asmjit/fmt/capstone) — those cold deps stay pre-built .a and are appended to
+# the Setup.local line as libs. The exact CinderX source list and compile flags
+# are harvested from compile_commands.json (harvest_cinderx_build.py) so they
+# never drift from what CinderX actually compiles. The C++-flags build-system
+# patch (apply_cpython_cxx_patch) makes makesetup compile the .cpp sources with
+# C++ flags. _cinderx.cpp already defines PyInit__cinderx, so no out-of-band
+# wrapper is needed. Archives wrapped in --start-group/--end-group (circular
+# refs), then a full PGO cycle (`make profile-opt`) rebuilds the tree with CinderX
+# trained (see the PGO section below for the CinderX+JIT training task). The plain
+# prefix is then copied to the static prefix and its interpreter binary swapped for
+# the freshly built one (CPython is a static-libpython build, so copying the binary
+# suffices). The pure-Python cinderx package is added to the static venv separately
+# (install_cinderx_pythonlib).
 ###############################################################################
 
 # Map a C++ compiler name/path to its sibling C compiler (g++ -> gcc, clang++ ->
@@ -1232,20 +1703,20 @@ build_static_cpython() {
   # plain CPython was built with --disable-gil the two already agree.
   [ "$FREE_THREADING" -eq 1 ] && ft=1
 
-  # Free-threaded CPython installs its headers under include/python<ver>t (the 't'
-  # ABI-flag suffix), NOT include/python<ver>, so the wrapper compile's -I must
-  # carry the same suffix or it fails with "'Python.h' file not found". Derive the
-  # abiflags from $ft so both the GIL and free-threaded builds resolve correctly.
-  local pyabi=""
-  [ "$ft" -eq 1 ] && pyabi="t"
-
-  # Build the CinderX static archives with cmake (option matrix mirrors CinderX's
-  # setup.py for a stock 3.14+ non-meta interpreter; cinderx-lib transitively
-  # builds every sub-archive + vendored asmjit/fmt/capstone).
-  log "Building CinderX static archives via cmake (py=$pyver free_threading=$ft, CXX=$TOOLCHAIN_CXX) -> $STATIC_BUILD_DIR"
+  # Configure CinderX with cmake (option matrix mirrors CinderX's setup.py for a
+  # stock 3.14+ non-meta interpreter). We keep the FULL configure — it downloads
+  # the third-party deps (fmt/capstone/parallel-hashmap/usdt), generates the
+  # opcode/usdt headers into <build>/generated, and (with EXPORT_COMPILE_COMMANDS)
+  # emits compile_commands.json which we harvest for the exact CinderX source list
+  # and compile flags. LTO is left OFF here: CinderX's own sources are recompiled
+  # by CPython's make (which applies CPython's own -flto), and the third-party .a
+  # we build below are cold code where LTO adds little but complicates the archive
+  # format. Same CC/CXX as CPython so the C++ ABI/libstdc++ match.
+  log "Configuring CinderX via cmake (py=$pyver free_threading=$ft, CXX=$TOOLCHAIN_CXX) -> $STATIC_BUILD_DIR"
   mkdir -p "$STATIC_BUILD_DIR"
   cmake -G Ninja -B "$STATIC_BUILD_DIR" "$SRC_CINDERX" \
       -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
       -DCMAKE_C_COMPILER="$TOOLCHAIN_CC" \
       -DCMAKE_CXX_COMPILER="$TOOLCHAIN_CXX" \
       -DPY_VERSION="$pyver" \
@@ -1261,7 +1732,7 @@ build_static_cpython() {
       -DENABLE_INTERPRETER_LOOP=1 \
       -DENABLE_LAZY_IMPORTS=0 \
       -DENABLE_LIGHTWEIGHT_FRAMES=0 \
-      -DENABLE_LTO=ON \
+      -DENABLE_LTO=OFF \
       -DENABLE_PARALLEL_GC=0 \
       -DENABLE_PEP523_HOOK=1 \
       -DENABLE_PERF_TRAMPOLINE=0 \
@@ -1270,130 +1741,183 @@ build_static_cpython() {
       -DENABLE_ZLIB=1 \
       >"$LOGDIR/static_cmake_configure.log" 2>&1 \
     || die "CinderX cmake configure failed (see $LOGDIR/static_cmake_configure.log)"
-  cmake --build "$STATIC_BUILD_DIR" --target cinderx-lib -j "$JOBS" \
-      >"$LOGDIR/static_cmake_build.log" 2>&1 \
-    || die "CinderX cmake build failed (see $LOGDIR/static_cmake_build.log)"
 
-  # Collect every produced static archive (robust against layout changes).
-  local archives=()
-  while IFS= read -r a; do archives+=("$a"); done \
-    < <(find "$STATIC_BUILD_DIR" -name '*.a' | sort)
-  [ "${#archives[@]}" -gt 0 ] || die "no .a archives produced under $STATIC_BUILD_DIR"
-  printf '%s\n' "${archives[@]}" | grep -q 'libcinderx-lib\.a$' \
-    || die "libcinderx-lib.a not found among produced archives"
-  ok "Built ${#archives[@]} CinderX static archives"
+  # Build ONLY the third-party static libs (asmjit/fmt/capstone). CinderX's own
+  # code is NOT built by cmake — CPython's make compiles it from the sources we
+  # list in Setup.local below (so PGO+LTO cover it). Fall back to the full
+  # cinderx-lib target if the third-party target names ever change.
+  local cc_json="$STATIC_BUILD_DIR/compile_commands.json"
+  [ -f "$cc_json" ] || die "cmake did not emit compile_commands.json at $cc_json"
+  log "Building CinderX third-party static libs via cmake (asmjit/fmt/capstone, -j$JOBS)"
+  if ! cmake --build "$STATIC_BUILD_DIR" --target asmjit fmt capstone_static -j "$JOBS" \
+        >"$LOGDIR/static_cmake_build.log" 2>&1; then
+    warn "Targeted third-party build failed; falling back to full cinderx-lib build (see $LOGDIR/static_cmake_build.log)"
+    cmake --build "$STATIC_BUILD_DIR" --target cinderx-lib -j "$JOBS" \
+        >>"$LOGDIR/static_cmake_build.log" 2>&1 \
+      || die "CinderX cmake build failed (see $LOGDIR/static_cmake_build.log)"
+  fi
 
-  # Compile the PyInit__cinderx wrapper out-of-band. It MUST be C++ — the bridged
-  # _cinderx_lib_init() has C++ (mangled) linkage in the archive. Compiled here
-  # (not via makesetup) because makesetup's .cpp rule injects C-only -std=c11.
-  local wrapper_cpp="$STATIC_BUILD_DIR/_cinderx_static.cpp"
-  local wrapper_o="$STATIC_BUILD_DIR/_cinderx_static.o"
-  cat > "$wrapper_cpp" <<'CPPEOF'
-// Static-link entry point for the builtin _cinderx module (generated by
-// cinderx-benchmark.sh).
-//
-// All CinderX module logic lives in libcinderx-lib.a, but PyInit__cinderx
-// normally lives in cinderx/_cinderx.cpp which is only compiled into _cinderx.so.
-// For a builtin (static) module we supply that entry point here; CPython's
-// generated inittab (Modules/config.c) calls it.
-//
-// _cinderx_lib_init() has C++ linkage in the archive, so this file MUST be
-// compiled as C++. PyInit__cinderx itself is extern "C" (PyMODINIT_FUNC), so the
-// C-compiled config.c resolves it by its unmangled name.
-#include <Python.h>
+  # Collect the third-party archives (asmjit/fmt/capstone) to append as libs.
+  local tp_archives=() a
+  while IFS= read -r a; do tp_archives+=("$a"); done \
+    < <(find "$STATIC_BUILD_DIR" \( -name 'libasmjit.a' -o -name 'libfmt.a' -o -name 'libcapstone*.a' \) | sort -u)
+  [ "${#tp_archives[@]}" -ge 1 ] \
+    || die "no third-party archives (asmjit/fmt/capstone) produced under $STATIC_BUILD_DIR (see $LOGDIR/static_cmake_build.log)"
+  ok "Built ${#tp_archives[@]} third-party archives: $(for a in "${tp_archives[@]}"; do basename "$a"; done | tr '\n' ' ')"
 
-// Defined in libcinderx-lib.a.
-PyObject* _cinderx_lib_init();
+  # Copy CinderX's package into Modules/cinderx so its sources are reachable as
+  # paths relative to Modules/ (makesetup runs with `-s Modules`) with their
+  # directory structure intact — required because (a) makesetup emits object files
+  # next to their sources and does not mkdir, and (b) CinderX has duplicate
+  # basenames across directories (type.cpp, parser.cpp, ...) that would collide if
+  # flattened. Copying (not symlinking) keeps the generated .o out of the shared
+  # $SRC_CINDERX checkout that the dynamic build also uses.
+  local modcinderx="$SRC_CPYTHON/Modules/cinderx"
+  log "Copying CinderX sources into $modcinderx"
+  rm -rf "$modcinderx"
+  cp -a "$SRC_CINDERX/cinderx" "$modcinderx" \
+    || die "failed to copy CinderX sources into $modcinderx"
 
-PyMODINIT_FUNC PyInit__cinderx(void) {
-  return _cinderx_lib_init();
-}
-CPPEOF
-  log "Compiling PyInit__cinderx wrapper ($TOOLCHAIN_CXX, out-of-band)"
-  "$TOOLCHAIN_CXX" -std=c++20 -fPIC -O2 \
-      -I"$PY_PREFIX/include/python$pyver$pyabi" \
-      -c "$wrapper_cpp" -o "$wrapper_o" \
-      >"$LOGDIR/static_wrapper_compile.log" 2>&1 \
-    || die "wrapper compile failed (see $LOGDIR/static_wrapper_compile.log)"
+  # Harvest the exact CinderX source list + compile flags from compile_commands.json
+  # (so they never drift from what CinderX actually compiles). Sources come back as
+  # Modules-relative paths (cinderx/<rel>); flags come back as a single CINDERX_CFLAGS
+  # value (includes/defines/warnings/-std=c++20, minus CPython-supplied opt/LTO/PGO
+  # and the installed-Python includes).
+  local flags_file="$STATIC_BUILD_DIR/cinderx_cflags.txt"
+  local srcs_file="$STATIC_BUILD_DIR/cinderx_sources.txt"
+  log "Harvesting CinderX sources + flags from $cc_json"
+  python3 "$HELPERS/harvest_cinderx_build.py" \
+      "$cc_json" "$SRC_CINDERX/cinderx" "$flags_file" "$srcs_file" \
+      >"$LOGDIR/static_harvest.log" 2>&1 \
+    || die "harvesting CinderX sources/flags failed (see $LOGDIR/static_harvest.log)"
+  local nsrc; nsrc="$(grep -c . "$srcs_file" 2>/dev/null || echo 0)"
+  [ "$nsrc" -ge 100 ] \
+    || die "harvest produced only $nsrc CinderX sources (expected ~145); see $LOGDIR/static_harvest.log"
+  ok "Harvested $nsrc CinderX sources + compile flags"
 
-  # Declare _cinderx as a builtin static module in Modules/Setup.local. Because
-  # CPython and the CinderX archives are built with the SAME compiler
-  # (detect_toolchain), their libstdc++ versions match, so we link the C++ runtime
-  # dynamically (-lstdc++). The archives are wrapped in --start-group/--end-group
-  # to resolve their circular references; -lz/-lm satisfy CinderX's deps.
-  local a
-  log "Writing $SRC_CPYTHON/Modules/Setup.local"
+  # Declare _cinderx as a builtin static module in Modules/Setup.local, SOURCE-LISTED.
+  # CPython's make compiles every CinderX source (so PGO training + LTO cover them);
+  # the cold third-party libs stay pre-built .a, wrapped in --start-group/--end-group
+  # for their circular references. CPython and CinderX use the SAME compiler, so the
+  # C++ runtime links dynamically (-lstdc++); -lz/-lm satisfy CinderX's deps. All
+  # compile flags live in the CINDERX_CFLAGS make variable (makesetup routes a
+  # $(*_CFLAGS) token to the compiler and never parses the awkward flags inside).
+  local cinderx_cflags; cinderx_cflags="$(cat "$flags_file")"
+  log "Writing $SRC_CPYTHON/Modules/Setup.local (source-listed CinderX + third-party .a)"
   {
-    echo "# Auto-generated by cinderx-benchmark.sh — statically link CinderX."
-    echo "# Wrapper .o (PyInit__cinderx) compiled out-of-band; archives from CinderX cmake."
-    echo "# Archives wrapped in --start-group/--end-group for their circular references."
-    printf '_cinderx %s -Wl,--start-group' "$wrapper_o"
-    for a in "${archives[@]}"; do printf ' %s' "$a"; done
+    echo "# Auto-generated by cinderx-benchmark.sh — HYBRID static CinderX."
+    echo "# CinderX's own sources are compiled by CPython's make (PGO+LTO cover them);"
+    echo "# third-party libs (asmjit/fmt/capstone) are pre-built .a from cmake."
+    echo "# Flags harvested from cmake compile_commands.json; sources under Modules/cinderx."
+    printf 'CINDERX_CFLAGS= %s\n' "$cinderx_cflags"
+    echo ""
+    printf '_cinderx'
+    while IFS= read -r src; do
+      [ -n "$src" ] && printf ' \\\n    %s' "$src"
+    done < "$srcs_file"
+    printf ' \\\n    $(CINDERX_CFLAGS) \\\n'
+    printf '    -Wl,--start-group'
+    for a in "${tp_archives[@]}"; do printf ' %s' "$a"; done
     printf ' -Wl,--end-group -lstdc++ -lz -lm\n'
   } > "$SRC_CPYTHON/Modules/Setup.local"
 
-  # --- Preserve PGO across the static relink -------------------------------
-  # The plain build gets its PGO from CPython's `profile-opt` target, whose final
-  # "use" phase passes the profile-use flag on the *make command line*
-  #   $(MAKE) build_all CFLAGS_NODIST="$(CFLAGS_NODIST) $(PGO_PROF_USE_FLAG)"
-  # The flag is NOT persisted in the generated Makefile. Editing Setup.local forces
-  # the relink to recompile the builtin extension modules (config, posixmodule,
-  # _io/*, _sre, _datetimemodule, itertoolsmodule, _collectionsmodule,
-  # _functoolsmodule, ... ~40 objects); the interpreter core (Python/ceval.o,
-  # Objects/*) is NOT recompiled, so it keeps its PGO. But those recompiled modules,
-  # built by a bare `make python`, lose -fprofile-*use — the exact regression this
-  # fixes (foobar13: 0 occurrences of fprofile in the relink; the plain build had it
-  # on every module compile).
+  # --- Full PGO cycle for the static interpreter (CPython + CinderX/JIT) -----
+  # CinderX's own sources are now source-listed in Setup.local, so CPython's make
+  # compiles them under -fprofile-generate during PGO instrumentation. The piece the
+  # plain build could not provide is TRAINING data for those objects: the plain
+  # PROFILE_TASK (the stdlib test suite) ran before CinderX was in the tree AND never
+  # enabled the JIT, so CinderX funcs had zero counts and only inherited the
+  # profile-USE flag against empty data (gcc's -fprofile-correction merely tolerated
+  # the gap; no profile-driven layout).
   #
-  # Re-apply the flag exactly as profile-opt does: append $(PGO_PROF_USE_FLAG) to
-  # CFLAGS_NODIST on the `make python` command line. We pass it as a literal make
-  # reference (single-quoted so bash does not touch it) so make resolves it to
-  # whatever the Makefile defines for THIS toolchain — clang:
-  #   -fprofile-instr-use="$(shell pwd)/code.profclangd"   (expands to this tree)
-  # gcc:
-  #   -fprofile-use -fprofile-correction                   (reads .gcda beside objects)
-  # The profile data (code.profclangd / *.gcda) is left in the build tree by the
-  # plain build's profile-opt run, so the flag resolves against real data.
+  # Fix: re-run CPython's OWN `profile-opt` pipeline now, with CinderX present and an
+  # augmented PROFILE_TASK that trains BOTH halves of the interpreter:
+  #   1. the stdlib regression suite (-m test --pgo)   -> CPython core paths
+  #   2. cinderx_jit_workload.py (JIT enabled)          -> CinderX runtime + JIT
+  # profile-opt does the full instrument -> train -> use cycle for us: build_all with
+  # $(PGO_PROF_GEN_FLAG), run $(PROFILE_TASK), merge via $(LLVM_PROF_MERGER), then
+  # rebuild with $(PGO_PROF_USE_FLAG). So the optimized static binary is PGO-driven
+  # across the CPython/CinderX boundary using REAL CinderX counts (PGO-guided layout
+  # of the JIT compiler hot paths, indirect-call promotion for the eval-frame hook,
+  # cross-boundary inlining decisions). It is compiler-agnostic because it uses the
+  # Makefile's own PGO variables — gcc accumulates .gcda beside each object; clang
+  # writes a unique code-<pid>.profclangr per process (LLVM_PROFILE_FILE=...%p...)
+  # and merges them — so both the -m test workers and the JIT workload contribute.
   #
-  # Guarded on profile-run-stamp (written only after a successful PGO training run)
-  # AND a non-empty PGO_PROF_USE_FLAG, so a reused non-optimized tree still relinks
-  # cleanly instead of failing on a missing profile.
-  local relink_args=() pgo_use_flag="" base_cflags_nodist=""
+  # profile-{run,gen,clean}-stamp are stamp FILES; if left from the plain build, make
+  # treats the profile as done and SKIPS retraining (the Makefile documents removing
+  # profile-run-stamp to force a re-run). Remove all three so profile-clean-stamp ->
+  # clean-profile wipes the stale plain profile data before the fresh instrumented
+  # build. NOTE: the plain interpreter is already installed in $PY_PREFIX (build_cpython
+  # ran `make install` before us), so re-running the cycle in this shared tree — which
+  # now recompiles the core too, giving the static build a from-scratch PGO rather
+  # than reusing the plain one — cannot affect the already-materialised plain binary.
+  #
+  # Gated on the plain build actually being PGO-optimized (non-empty PGO_PROF_USE_FLAG):
+  # a tree configured without --enable-optimizations has no PGO machinery, so we fall
+  # back to the cheap `make python` relink (no PGO) below.
+  local pgo_use_flag="" did_pgo_cycle=0
   pgo_use_flag="$(sed -n 's/^PGO_PROF_USE_FLAG[[:space:]]*=[[:space:]]*//p' "$SRC_CPYTHON/Makefile" | head -1)"
-  if [ -f "$SRC_CPYTHON/profile-run-stamp" ] && [ -n "$pgo_use_flag" ]; then
-    # $(CFLAGS_NODIST) is empty in a stock CPython Makefile, but preserve any base
-    # value defensively, then append the profile-use flag (mirrors profile-opt).
-    base_cflags_nodist="$(sed -n 's/^CFLAGS_NODIST[[:space:]]*=[[:space:]]*//p' "$SRC_CPYTHON/Makefile" | head -1)"
-    relink_args+=("CFLAGS_NODIST=${base_cflags_nodist:+$base_cflags_nodist }"'$(PGO_PROF_USE_FLAG)')
-    log "PGO: static relink will recompile with profile-use flags (PGO_PROF_USE_FLAG=$pgo_use_flag)"
+
+  if [ -n "$pgo_use_flag" ]; then
+    local pgo_task="$HELPERS/pgo_cinderx_train.py"
+    [ -f "$pgo_task" ] || die "PGO training driver missing at $pgo_task (write_helpers not run?)"
+
+    # Settle the Setup.local -> Makefile/config.c regeneration up front (cheap; just
+    # runs makesetup) so the instrumented build below definitely links builtin _cinderx.
+    log "PGO(static): regenerating build config for the CinderX Setup.local"
+    ( cd "$SRC_CPYTHON" && make -s Modules/config.c ) \
+      >"$LOGDIR/static_pgo_configc.log" 2>&1 || true
+
+    # Force a fresh instrument+train+use cycle (see above).
+    rm -f "$SRC_CPYTHON/profile-run-stamp" \
+          "$SRC_CPYTHON/profile-gen-stamp" \
+          "$SRC_CPYTHON/profile-clean-stamp"
+
+    log "PGO(static): running full profile-opt with CinderX+JIT training (instrument -> train -> optimize; this is slow)"
+    log "PGO(static): PROFILE_TASK = -m test --pgo (CPython) + cinderx_jit_workload.py (CinderX JIT)"
+    if ( cd "$SRC_CPYTHON" && make profile-opt -j"$JOBS" PROFILE_TASK="$pgo_task" ) \
+         >"$LOGDIR/static_pgo_build.log" 2>&1; then
+      did_pgo_cycle=1
+      ok "PGO(static): full CinderX+JIT PGO cycle completed (PGO_PROF_USE_FLAG=$pgo_use_flag)"
+    else
+      # A failed cycle can leave the tree with -fprofile-generate instrumented core
+      # objects; a plain `make python` would then link a SLOW instrumented benchmark
+      # binary. That is worse than failing, and the plain interpreter is already safe
+      # in $PY_PREFIX, so abort rather than silently ship a bad static binary.
+      die "PGO(static): profile-opt cycle failed (see $LOGDIR/static_pgo_build.log). The build tree may be left instrumented; not relinking to avoid shipping a mis-instrumented static binary."
+    fi
   else
-    warn "PGO: no trained profile in $SRC_CPYTHON (profile-run-stamp / PGO_PROF_USE_FLAG missing); static relink will NOT be PGO-optimized"
+    warn "PGO(static): plain build is not PGO-optimized (empty PGO_PROF_USE_FLAG); doing a plain relink (no PGO)"
+    # No PGO available: relink the builtin _cinderx with a bare `make python`.
+    # Editing Setup.local makes the Makefile regenerate on the first invocation;
+    # run again so the new config.c/_cinderx links.
+    log "Relinking CPython with the builtin _cinderx (make python -j$JOBS)"
+    ( cd "$SRC_CPYTHON" && make python -j"$JOBS" ) \
+        >"$LOGDIR/static_make_python.log" 2>&1 || true
+    if ! "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null; then
+      log "  (re-running make python after Makefile regeneration)"
+      ( cd "$SRC_CPYTHON" && make python -j"$JOBS" ) \
+          >>"$LOGDIR/static_make_python.log" 2>&1 || true
+    fi
   fi
 
-  # Relink. Use `make python` (NOT plain `make`, which would redo the full PGO
-  # instrument+train pass). Editing Setup.local makes the Makefile regenerate
-  # itself on the first invocation; run again so the new config.c/_cinderx links.
-  log "Relinking CPython with the builtin _cinderx (make python -j$JOBS)"
-  ( cd "$SRC_CPYTHON" && make python -j"$JOBS" "${relink_args[@]}" ) \
-      >"$LOGDIR/static_make_python.log" 2>&1 || true
-  if ! "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null; then
-    log "  (re-running make python after Makefile regeneration)"
-    ( cd "$SRC_CPYTHON" && make python -j"$JOBS" "${relink_args[@]}" ) \
-        >>"$LOGDIR/static_make_python.log" 2>&1 || true
-  fi
   "$SRC_CPYTHON/python" -c "import sys; sys.exit(0 if '_cinderx' in sys.builtin_module_names else 1)" 2>/dev/null \
-    || die "could not link builtin _cinderx (see $LOGDIR/static_make_python.log)"
+    || die "could not link builtin _cinderx (see $LOGDIR/static_pgo_build.log / static_make_python.log)"
   ok "Linked builtin _cinderx"
 
-  # Verify PGO parity: the relink log should now show the profile-use flag on the
-  # recompiled objects (the task's success criterion). Soft-checked — a warning,
-  # not a failure, so the pipeline still completes if make short-circuited with
-  # nothing to recompile.
-  if [ "${#relink_args[@]}" -gt 0 ]; then
-    if grep -q 'fprofile' "$LOGDIR/static_make_python.log" 2>/dev/null; then
-      ok "PGO: static relink recompiled objects with profile-use flags (PGO retained)"
+  # Verify the PGO cycle actually exercised CinderX+JIT and recompiled with profile
+  # flags (the task's success criteria). Soft-checked — warnings, not failures.
+  if [ "$did_pgo_cycle" -eq 1 ]; then
+    if grep -q '\[jit-workload\] done' "$LOGDIR/static_pgo_build.log" 2>/dev/null; then
+      ok "PGO(static): CinderX JIT training workload ran under instrumentation ($(grep -o '\[jit-workload\] done:.*' "$LOGDIR/static_pgo_build.log" | head -1))"
     else
-      warn "PGO: expected profile-use flags in the static relink but none found in $LOGDIR/static_make_python.log"
+      warn "PGO(static): CinderX JIT training banner not found in $LOGDIR/static_pgo_build.log (JIT may not have exercised CinderX)"
+    fi
+    if grep -q 'fprofile' "$LOGDIR/static_pgo_build.log" 2>/dev/null; then
+      ok "PGO(static): objects recompiled with profile flags (instrument + use passes present)"
+    else
+      warn "PGO(static): no 'fprofile' flags seen in $LOGDIR/static_pgo_build.log"
     fi
   fi
 
